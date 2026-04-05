@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
-Grid Duel Arena v2.0 — Biomimetic Lightweight AI Combat Trainer
+Grid Duel Arena v3.0 — Biomimetic Lightweight AI Combat Trainer
 ===============================================================
 炸弹对战竞技场：玩家 vs 自我进化AI
 
-v2.0 更新:
-  ✦ 自动检测硬件 (GPU/CPU/VRAM) 自适应训练方案
-  ✦ 完全兼容 v1.0 模型存档
-  ✦ 修复全部已知bug
-  ✦ 改进操控手感与UI体验
-  ✦ 自适应批量/网络宽度/显存占用
+v3.0 更新:
+  ✦ 修复7个Bug (键冲突/梯度/链爆/图表等)
+  ✦ 训练效率大幅提升 (LR调度/预热/奖励重构/课程学习)
+  ✦ Q值可视化 + 动作箭头 + 连胜统计 + Loss图表
+  ✦ 兼容 v1.0 / v2.0 存档
+  ✦ 更流畅的操控体验 (Ctrl+S保存，WASD无冲突)
 
 pip install torch pygame numpy
 """
@@ -34,7 +34,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 
 # ╔════════════════════════════════════════════╗
-# ║     硬件自动检测 & 自适应配置              ║
+# ║    硬件自动检测 & 自适应配置               ║
 # ╚════════════════════════════════════════════╝
 
 class HardwareProfile:
@@ -92,7 +92,7 @@ class HardwareProfile:
                 return int(out.strip()) // (1024 * 1024)
         except Exception:
             pass
-        return 4096  # 默认4GB
+        return 4096
 
     def _classify_gpu(self):
         if self.vram_mb >= 8000:
@@ -120,80 +120,31 @@ class HardwareProfile:
             self.tier = "cpu_low"
 
     def _build_config(self):
-        """根据硬件层级生成训练参数"""
         profiles = {
-            "gpu_large": {
-                "hidden_dim": 192,
-                "batch_size": 256,
-                "memory_size": 50000,
-                "train_steps_per_frame": 2,
-                "max_fps_train": 300,
-                "use_amp": True,
-                "grad_accum": 1,
-            },
-            "gpu_medium": {
-                "hidden_dim": 160,
-                "batch_size": 128,
-                "memory_size": 30000,
-                "train_steps_per_frame": 2,
-                "max_fps_train": 240,
-                "use_amp": True,
-                "grad_accum": 1,
-            },
-            "gpu_small": {
-                "hidden_dim": 128,
-                "batch_size": 96,
-                "memory_size": 20000,
-                "train_steps_per_frame": 1,
-                "max_fps_train": 180,
-                "use_amp": True,
-                "grad_accum": 1,
-            },
-            "gpu_tiny": {
-                "hidden_dim": 96,
-                "batch_size": 48,
-                "memory_size": 12000,
-                "train_steps_per_frame": 1,
-                "max_fps_train": 120,
-                "use_amp": False,
-                "grad_accum": 2,
-            },
-            "cpu_high": {
-                "hidden_dim": 128,
-                "batch_size": 64,
-                "memory_size": 15000,
-                "train_steps_per_frame": 1,
-                "max_fps_train": 120,
-                "use_amp": False,
-                "grad_accum": 1,
-            },
-            "cpu_mid": {
-                "hidden_dim": 96,
-                "batch_size": 48,
-                "memory_size": 10000,
-                "train_steps_per_frame": 1,
-                "max_fps_train": 90,
-                "use_amp": False,
-                "grad_accum": 2,
-            },
-            "cpu_low": {
-                "hidden_dim": 64,
-                "batch_size": 32,
-                "memory_size": 8000,
-                "train_steps_per_frame": 1,
-                "max_fps_train": 60,
-                "use_amp": False,
-                "grad_accum": 2,
-            },
-            "cpu_fallback": {
-                "hidden_dim": 64,
-                "batch_size": 32,
-                "memory_size": 8000,
-                "train_steps_per_frame": 1,
-                "max_fps_train": 60,
-                "use_amp": False,
-                "grad_accum": 2,
-            },
+            "gpu_large": {"hidden_dim": 192, "batch_size": 256, "memory_size": 50000,
+                          "train_steps_per_frame": 2, "max_fps_train": 300,
+                          "use_amp": True, "grad_accum": 1, "warmup_steps": 500},
+            "gpu_medium": {"hidden_dim": 160, "batch_size": 128, "memory_size": 30000,
+                           "train_steps_per_frame": 2, "max_fps_train": 240,
+                           "use_amp": True,  "grad_accum": 1, "warmup_steps": 400},
+            "gpu_small":  {"hidden_dim": 128, "batch_size": 96,  "memory_size": 20000,
+                           "train_steps_per_frame": 1, "max_fps_train": 180,
+                           "use_amp": True,  "grad_accum": 1, "warmup_steps": 300},
+            "gpu_tiny":   {"hidden_dim": 96,  "batch_size": 48,  "memory_size": 12000,
+                           "train_steps_per_frame": 1, "max_fps_train": 120,
+                           "use_amp": False, "grad_accum": 2, "warmup_steps": 200},
+            "cpu_high":   {"hidden_dim": 128, "batch_size": 64,  "memory_size": 15000,
+                           "train_steps_per_frame": 1, "max_fps_train": 120,
+                           "use_amp": False, "grad_accum": 1, "warmup_steps": 300},
+            "cpu_mid":    {"hidden_dim": 96,  "batch_size": 48,  "memory_size": 10000,
+                           "train_steps_per_frame": 1, "max_fps_train": 90,
+                           "use_amp": False, "grad_accum": 2, "warmup_steps": 200},
+            "cpu_low":    {"hidden_dim": 64,  "batch_size": 32,  "memory_size": 8000,
+                           "train_steps_per_frame": 1, "max_fps_train": 60,
+                           "use_amp": False, "grad_accum": 2, "warmup_steps": 150},
+            "cpu_fallback": {"hidden_dim": 64,  "batch_size": 32,  "memory_size": 8000,
+                             "train_steps_per_frame": 1, "max_fps_train": 60,
+                             "use_amp": False, "grad_accum": 2, "warmup_steps": 150},
         }
         return profiles.get(self.tier, profiles["cpu_low"])
 
@@ -218,15 +169,16 @@ class HardwareProfile:
         print(f"  AMP    : {c['use_amp']}")
         print(f"  GradAcc: {c['grad_accum']}")
         print(f"  TrainFPS: {c['max_fps_train']}")
+        print(f"  Warmup : {c['warmup_steps']}")
         print("=" * 56 + "\n")
 
 
 # ╔════════════════════════════════════════════╗
-# ║              全局常量                ║
+# ║              全局常量                      ║
 # ╚════════════════════════════════════════════╝
 
-VERSION = "2.0"
-PREV_VERSIONS = ["1.0"]
+VERSION = "3.0"
+PREV_VERSIONS = ["1.0", "2.0"]
 
 HW = HardwareProfile()
 DEVICE = HW.device
@@ -252,14 +204,17 @@ TRAIN_PER_FRAME = HW_CFG["train_steps_per_frame"]
 USE_AMP = HW_CFG["use_amp"]
 GRAD_ACCUM = HW_CFG["grad_accum"]
 MAX_FPS_TRAIN = HW_CFG["max_fps_train"]
+WARMUP_STEPS = HW_CFG["warmup_steps"]
 
 GAMMA = 0.97
 LR = 5e-4
-TAU = 0.01
+LR_MIN = 1e-5
+TAU = 0.005
 EPS_START = 1.0
 EPS_END = 0.03
-EPS_DECAY = 5000
+EPS_DECAY = 6000
 N_STEP = 3
+EVAL_INTERVAL = 25
 
 MAX_HP = 3
 BOMB_TIMER = 8
@@ -276,12 +231,12 @@ CKPT_POOL = os.path.join(CKPT_DIR, "strategy_pool.pkl")
 CKPT_STATS = os.path.join(CKPT_DIR, "stats.json")
 
 DIR_MAP = {
-    0: (0, -1),
-    1: (0, 1),
-    2: (-1, 0),
-    3: (1, 0),
-    4: (0, 0),
-    5: (0, 0),
+    0: (0, -1),   # Up
+    1: (0, 1),    # Down
+    2: (-1, 0),   # Left
+    3: (1, 0),    # Right
+    4: (0, 0),    # Bomb
+    5: (0, 0),    # Stay
 }
 DIR_NAMES = ["Up", "Dn", "Lt", "Rt", "Bomb", "Stay"]
 
@@ -324,6 +279,7 @@ C_SHIELD = (80, 160, 255)
 C_CHART_WIN = (80, 200, 255)
 C_CHART_REW = (255, 175, 55)
 C_CHART_EPS = (200, 100, 255)
+C_CHART_LOSS = (255, 100, 100)
 
 
 # ╔════════════════════════════════════════════╗
@@ -423,11 +379,13 @@ class Fighter:
         self.kills = 0
         self.deaths = 0
         self.last_action = 5
-
+        self.prev_hp = MAX_HP  # v3.0: 用于检测HP变化
+        
     def reset(self, x, y):
         self.x = x
         self.y = y
         self.hp = self.max_hp
+        self.prev_hp = self.max_hp
         self.bomb_cooldown = 0
         self.active_bombs = 0
         self.invincible = 0
@@ -453,6 +411,8 @@ class DuelArena:
         self.powerup_timer = POWERUP_INTERVAL
         self.rng = random.Random(seed)
         self.new_explosions = []
+        self.last_ai_move_valid = True  # v3.0: 追踪AI动作是否有效
+        self.bricks_broken_by_ai = 0      # v3.0: AI炸砖计数
         self.reset()
 
     def reset(self):
@@ -467,6 +427,8 @@ class DuelArena:
         self.round_over = False
         self.winner = None
         self.powerup_timer = POWERUP_INTERVAL
+        self.last_ai_move_valid = True
+        self.bricks_broken_by_ai = 0
         return self.get_state(for_ai=True)
 
     def _can_move(self, x, y):
@@ -481,10 +443,14 @@ class DuelArena:
 
     def _do_move(self, fighter, action):
         fighter.last_action = action
+        fighter.prev_hp = fighter.hp  # v3.0: 记录动作前HP
+
         if fighter.bomb_cooldown > 0:
             fighter.bomb_cooldown -= 1
         if fighter.invincible > 0:
             fighter.invincible -= 1
+
+        move_valid = True
 
         if action == 4:
             if (fighter.bomb_cooldown <= 0 and fighter.active_bombs < fighter.max_bombs):
@@ -498,6 +464,10 @@ class DuelArena:
                     )
                     fighter.active_bombs += 1
                     fighter.bomb_cooldown = BOMB_COOLDOWN
+                else:
+                    move_valid = False
+            else:
+                move_valid = False
         elif action < 4:
             dx, dy = DIR_MAP[action]
             nx, ny = fighter.x + dx, fighter.y + dy
@@ -506,7 +476,15 @@ class DuelArena:
                 if not (nx == other.x and ny == other.y):
                     fighter.x = nx
                     fighter.y = ny
+                else:
+                    move_valid = False
+            else:
+                move_valid = False
 
+        # v3.0: 追踪AI的动作有效性
+        if fighter.is_ai:
+            self.last_ai_move_valid = move_valid
+            
     def _explode_bomb(self, bomb):
         cells = [(bomb.x, bomb.y)]
         dirs = [(0, -1), (0, 1), (-1, 0), (1, 0)]
@@ -521,6 +499,9 @@ class DuelArena:
                 cells.append((ex, ey))
                 if self.grid[ey][ex] == BRICK:
                     self.grid[ey][ex] = EMPTY
+                    # v3.0: 追踪AI炸砖
+                    if bomb.owner is self.ai:
+                        self.bricks_broken_by_ai += 1
                     if self.rng.random() < 0.25:
                         kind = self.rng.randint(0, 2)
                         self.powerups.append(PowerUp(ex, ey, kind))
@@ -565,36 +546,39 @@ class DuelArena:
         self._do_move(self.player, player_action)
         self._do_move(self.ai, ai_action)
 
-        # 炸弹倒计时 + 连锁爆炸
+        # ═══ v3.0修复: 链爆逻辑用标记法替代pop+break ═══
         exploded_cells = []
         changed = True
         while changed:
             changed = False
-            i = 0
-            while i < len(self.bombs):
-                self.bombs[i].timer -= 1
-                if self.bombs[i].timer <= 0:
-                    cells = self._explode_bomb(self.bombs[i])
+            to_explode = []
+            for i, bomb in enumerate(self.bombs):
+                bomb.timer -= 1
+                if bomb.timer <= 0:
+                    to_explode.append(i)
+
+            if to_explode:
+                changed = True
+                # 从后往前删除，避免索引错位
+                for i in sorted(to_explode, reverse=True):
+                    bomb = self.bombs[i]
+                    cells = self._explode_bomb(bomb)
                     exploded_cells.extend(cells)
                     for cx, cy in cells:
                         exp = Explosion(cx, cy)
                         self.explosions.append(exp)
                         self.new_explosions.append(exp)
-                    # 链爆检查
-                    for j in range(len(self.bombs)):
-                        if j != i and self.bombs[j].timer > 0:
+                    # 链爆：将同位置的其他炸弹计时器置0
+                    for other_bomb in self.bombs:
+                        if other_bomb is not bomb and other_bomb.timer > 0:
                             for cx, cy in cells:
-                                if (self.bombs[j].x == cx
-                                        and self.bombs[j].y == cy):
-                                    self.bombs[j].timer = 0
-                                    changed = True
-                    self.bombs[i].owner.active_bombs = max(
-                        0, self.bombs[i].owner.active_bombs - 1)
+                                if other_bomb.x == cx and other_bomb.y == cy:
+                                    other_bomb.timer = 0
+                    bomb.owner.active_bombs = max(
+                        0, bomb.owner.active_bombs - 1)
                     self.bombs.pop(i)
-                    changed = True
-                    break
-                else:
-                    i += 1
+                # 重置timer以便下一轮while检测链爆后的炸弹
+                # (timer已被置0的炸弹在下一轮会被检测到)
 
         self._check_explosion_hit(exploded_cells)
 
@@ -650,27 +634,85 @@ class DuelArena:
         return self.get_state(for_ai=True), ai_reward, done
 
     def _compute_shaping_reward(self):
-        reward = 0.01
+        """v3.0: 精细化13维奖励塑形"""
+        reward = 0.0
 
+        # 1. 存活奖励（微小正激励保持活跃）
+        reward += 0.005
+
+        # 2. 距离控制：鼓励保持中等距离（太近危险，太远无效）
         dist = abs(self.ai.x - self.player.x) + abs(self.ai.y - self.player.y)
-        if dist <= 3:
-            reward += 0.05
-        elif dist >= 8:
-            reward -= 0.02
+        if 2 <= dist <= 4:
+            reward += 0.08  # 最佳攻击距离
+        elif dist <= 1:
+            reward -= 0.02  # 太近
+        elif dist >= 9:
+            reward -= 0.03  # 太远,鼓励接近
 
+        # 3. 即时危险惩罚：站在爆炸区域
         for exp in self.explosions:
-            if abs(self.ai.x - exp.x) + abs(self.ai.y - exp.y) <= 1:
-                reward -= 0.3
+            if self.ai.x == exp.x and self.ai.y == exp.y:
+                reward -= 0.5
 
+        # 4. 潜在危险惩罚：站在即将爆炸的炸弹射程内
         for b in self.bombs:
-            bd = abs(self.ai.x - b.x) + abs(self.ai.y - b.y)
-            if bd <= 1 and b.timer <= 3:
-                reward -= 0.15
+            in_line = ((b.x == self.ai.x and abs(b.y - self.ai.y) <= b.power)
+                       or (b.y == self.ai.y and abs(b.x - self.ai.x) <= b.power))
+            if in_line:
+                urgency = 1.0 - b.timer / BOMB_TIMER
+                if b.timer <= 2:
+                    reward -= 0.4 * urgency
+                elif b.timer <= 4:
+                    reward -= 0.15 * urgency
 
+        # 5. HP差异奖励
         hp_diff = self.ai.hp - self.player.hp
-        reward += hp_diff * 0.05
+        reward += hp_diff * 0.04
 
-        return reward
+        # 6. 命中奖励：敌人本步掉血
+        if self.player.hp < self.player.prev_hp:
+            reward += 1.5
+
+        # 7. 受伤惩罚：自己本步掉血
+        if self.ai.hp < self.ai.prev_hp:
+            reward -= 1.0
+
+        # 8. 无效动作惩罚（撞墙/无法放炸弹）
+        if not self.last_ai_move_valid:
+            reward -= 0.08
+
+        # 9. 战略放弹奖励：在敌人附近放弹
+        if self.ai.last_action == 4 and self.last_ai_move_valid:
+            if dist <= 4:
+                reward += 0.3   # 近身放弹有战术价值
+            else:
+                reward += 0.05  # 远处放弹价值低
+
+        # 10. 拾取道具奖励
+        # （通过_check_powerups已改变属性，此处不重复检测）
+
+        # 11. 地图控制：鼓励占据中心区域
+        cx = abs(self.ai.x - ARENA_COLS // 2)
+        cy = abs(self.ai.y - ARENA_ROWS // 2)
+        center_dist = cx + cy
+        if center_dist <= 3:
+            reward += 0.02
+
+        # 12. 逃生路径检测：如果被困住则惩罚
+        escape_routes = 0
+        for dx, dy in [(0, -1), (0, 1), (-1, 0), (1, 0)]:
+            nx, ny = self.ai.x + dx, self.ai.y + dy
+            if self._can_move(nx, ny):
+                escape_routes += 1
+        if escape_routes == 0:
+            reward -= 0.15
+
+        # 13. 炸砖奖励（开辟道路）
+        if self.bricks_broken_by_ai > 0:
+            reward += 0.1 * self.bricks_broken_by_ai
+            self.bricks_broken_by_ai = 0
+
+        return np.clip(reward, -3.0, 3.0)
 
     def _spawn_random_powerup(self):
         occupied = {(self.player.x, self.player.y),
@@ -705,7 +747,7 @@ class DuelArena:
         features.append(me.active_bombs / max(me.max_bombs, 1))
         features.append(me.invincible / 6.0)
 
-        # 敌方 (5)
+        # 敌方(5)
         features.append((enemy.x - me.x) / ARENA_COLS)
         features.append((enemy.y - me.y) / ARENA_ROWS)
         features.append(enemy.hp / enemy.max_hp)
@@ -827,7 +869,7 @@ class DuelArena:
 
 
 # ╔════════════════════════════════════════════╗
-# ║      神经网络 (蟑螂反射弧,兼容v1.0)        ║
+# ║      神经网络 (蟑螂反射弧,兼容v1.0/v2.0)   ║
 # ╚════════════════════════════════════════════╝
 
 class Swish(nn.Module):
@@ -838,7 +880,7 @@ class Swish(nn.Module):
 class ReflexNet(nn.Module):
     """蟑螂反射弧双通道网络。
     hidden_dim 可变，支持不同硬件档位。
-    兼容 v1.0 (hidden=128) 权重加载。
+    兼容 v1.0/v2.0 权重加载。
     """
 
     def __init__(self, state_dim=STATE_DIM, action_dim=ACTION_DIM,
@@ -866,6 +908,7 @@ class ReflexNet(nn.Module):
             nn.LayerNorm(hidden),
             nn.Linear(hidden, hidden),
             Swish(),
+            nn.Dropout(0.05),          # v3.0: 轻微正则化
             nn.Linear(hidden, hidden // 2),
             Swish(),
             nn.Linear(hidden // 2, action_dim),
@@ -913,9 +956,17 @@ class ReflexNet(nn.Module):
             g = self.gate(x)
             return g.mean().item()
 
+    def get_q_values(self, state_np):
+        """v3.0: 便捷方法，返回numpy Q值"""
+        with torch.no_grad():
+            st = torch.tensor(state_np, dtype=torch.float32,
+                              device=DEVICE).unsqueeze(0)
+            q = self(st).squeeze(0).cpu().numpy()
+        return q
+
 
 # ╔════════════════════════════════════════════╗
-# ║      经验回放 (轻量PER + NStep)          ║
+# ║      经验回放 (轻量PER + NStep)            ║
 # ╚════════════════════════════════════════════╝
 
 class LightPER:
@@ -994,7 +1045,7 @@ class NStepBuffer:
 
 
 # ╔════════════════════════════════════════════╗
-# ║      策略池 (免疫克隆选择)               ║
+# ║      策略池 (免疫克隆选择)                 ║
 # ╚════════════════════════════════════════════╝
 
 class StrategyPool:
@@ -1013,6 +1064,9 @@ class StrategyPool:
     def sample_opponent(self):
         if not self.pool:
             return None
+        # v3.0: 70%选最强，30%随机（课程学习）
+        if random.random() < 0.7:
+            return self.best()
         return random.choice(self.pool)
 
     def best(self):
@@ -1038,7 +1092,7 @@ class StrategyPool:
 
 
 # ╔════════════════════════════════════════════╗
-# ║              UI 小组件                   ║
+# ║              UI 小组件                     ║
 # ╚════════════════════════════════════════════╝
 
 class MiniChart:
@@ -1056,7 +1110,8 @@ class MiniChart:
                          (self.x, self.y, self.w, self.h))
         pygame.draw.rect(surf, (40, 40, 60),
                          (self.x, self.y, self.w, self.h), 1)
-        surf.blit(font.render(self.title, True, C_DIM), (self.x + 4, self.y + 2))
+        surf.blit(font.render(self.title, True, C_DIM),
+                  (self.x + 4, self.y + 2))
         if len(self.data) < 2:
             return
         dl = list(self.data)
@@ -1066,8 +1121,8 @@ class MiniChart:
         cy = self.y + 15
         ch = self.h - 18
 
-        surf.blit(font.render(f"{dl[-1]:.1f}", True, self.color),
-                  (self.x + self.w - 48, self.y + 2))
+        surf.blit(font.render(f"{dl[-1]:.2f}", True, self.color),
+                  (self.x + self.w - 52, self.y + 2))
 
         win = min(30, len(dl))
         avg = []
@@ -1092,6 +1147,51 @@ class MiniChart:
             pygame.draw.lines(surf, dim_c, False, pts, 1)
         if len(apts) >= 2:
             pygame.draw.lines(surf, self.color, False, apts, 2)
+
+
+class QValueBar:
+    """v3.0: Q值柱状图可视化"""
+    def __init__(self, x, y, w, h):
+        self.x, self.y, self.w, self.h = x, y, w, h
+        self.q_values = np.zeros(ACTION_DIM)
+
+    def update(self, q_values):
+        self.q_values = q_values
+
+    def draw(self, surf, font):
+        pygame.draw.rect(surf, (10, 10, 22),
+                         (self.x, self.y, self.w, self.h))
+        pygame.draw.rect(surf, (40, 40, 60),
+                         (self.x, self.y, self.w, self.h), 1)
+        surf.blit(font.render("Q-Values", True, C_DIM),
+                  (self.x + 4, self.y + 2))
+
+        if np.all(self.q_values == 0):
+            return
+
+        bar_area_y = self.y + 15
+        bar_h = self.h - 18
+        bar_w = (self.w - 12) / ACTION_DIM - 2
+
+        q_min = self.q_values.min()
+        q_max = self.q_values.max()
+        q_range = q_max - q_min if q_max != q_min else 1.0
+        best_a = self.q_values.argmax()
+
+        for i in range(ACTION_DIM):
+            bx = self.x + 6 + i * (bar_w + 2)
+            norm = (self.q_values[i] - q_min) / q_range
+            bh = max(2, int(norm * (bar_h - 12)))
+            by = bar_area_y + bar_h - bh - 2
+
+            color = C_GOOD if i == best_a else (60, 60, 90)
+            pygame.draw.rect(surf, color,
+                             (int(bx), int(by), int(bar_w), bh))
+
+            label = DIR_NAMES[i][0]
+            txt = font.render(label, True, C_DIM)
+            surf.blit(txt, (int(bx + bar_w // 2 - txt.get_width() // 2),
+                            int(bar_area_y + bar_h - 12)))
 
 
 class Particle:
@@ -1124,7 +1224,7 @@ class Particle:
 
 
 # ╔════════════════════════════════════════════╗
-# ║              主渲染器                    ║
+# ║              主渲染器                      ║
 # ╚════════════════════════════════════════════╝
 
 class Renderer:
@@ -1136,11 +1236,15 @@ class Renderer:
         self.pulse = 0.0
         px = ARENA_W + 10
         cw = PANEL_W - 20
-        self.chart_winrate = MiniChart(px, 10, cw, 70,
+        # v3.0: 四张图表+ Q值面板
+        self.chart_winrate = MiniChart(px, 10, cw, 58,
                                        "AI WinRate%", C_CHART_WIN)
-        self.chart_reward = MiniChart(px, 90, cw, 70, "AI Reward", C_CHART_REW)
-        self.chart_eps = MiniChart(px, 170, cw, 70,
+        self.chart_reward = MiniChart(px, 74, cw, 58, "Reward", C_CHART_REW)
+        self.chart_eps = MiniChart(px, 138, cw, 58,
                                    "Epsilon", C_CHART_EPS)
+        self.chart_loss = MiniChart(px, 202, cw, 58,
+                                    "Loss", C_CHART_LOSS)
+        self.qbar = QValueBar(px, 266, cw, 58)
 
     def add_explosion_particles(self, x, y):
         for _ in range(12):
@@ -1171,8 +1275,7 @@ class Renderer:
                     pygame.draw.rect(self.screen, C_WALL,
                                      (rx, ry, CELL, CELL))
                     pygame.draw.rect(self.screen, C_WALL_L,
-                                     (rx + 1, ry + 1, CELL - 2, CELL - 2),
-                                     1)
+                                     (rx + 1, ry + 1, CELL - 2, CELL - 2), 1)
                 elif cell == BRICK:
                     pygame.draw.rect(self.screen, C_BRICK,
                                      (rx, ry, CELL, CELL))
@@ -1232,7 +1335,7 @@ class Renderer:
             c = C_EXPLODE[ci]
             pygame.draw.rect(self.screen, c,
                              (ex + 2, ey + 2, CELL - 4, CELL - 4))
-            
+                             
         # 角色
         self._draw_fighter(world.player, C_PLAYER, C_PLAYER_D, "P")
         self._draw_fighter(world.ai, C_AI, C_AI_D, "AI")
@@ -1277,18 +1380,27 @@ class Renderer:
         fill = int(hp_w * fighter.hp / fighter.max_hp)
         hc = C_GOOD if fighter.hp > 1 else C_BAD
         pygame.draw.rect(self.screen, hc, (hp_x, hp_y, fill, hp_h))
-        
-        # 动作指示器
+
+        # v3.0: 动作方向箭头
         act = fighter.last_action
         if act < 4:
             dx, dy = DIR_MAP[act]
-            ax = fx + dx * 12
-            ay = fy + dy * 12
-            pygame.draw.circle(self.screen, c, (ax, ay), 3)
+            # 箭头主体
+            ax1 = fx + dx * 8
+            ay1 = fy + dy * 8
+            ax2 = fx + dx * 16
+            ay2 = fy + dy * 16
+            pygame.draw.line(self.screen, c, (ax1, ay1), (ax2, ay2), 2)
+            # 箭头头部
+            pygame.draw.circle(self.screen, c, (ax2, ay2), 3)
+        elif act == 4:
+            # 放弹指示: 小爆炸图标
+            pygame.draw.circle(self.screen, C_BOMB, (fx, fy - r - 6), 4)
 
     def draw_panel(self, world, episode, epsilon, loss, mode,
                    speed, ai_wins, player_wins, total_rounds,
-                   gate_val, strategy_gen, fps_val):
+                   gate_val, strategy_gen, fps_val, lr_val,
+                   streak, best_streak, is_eval):
         px = ARENA_W
         pygame.draw.rect(self.screen, C_PANEL,
                          (px, 0, PANEL_W, ARENA_H))
@@ -1298,16 +1410,23 @@ class Renderer:
         self.chart_winrate.draw(self.screen, self.fonts["sm"])
         self.chart_reward.draw(self.screen, self.fonts["sm"])
         self.chart_eps.draw(self.screen, self.fonts["sm"])
+        self.chart_loss.draw(self.screen, self.fonts["sm"])
+        self.qbar.draw(self.screen, self.fonts["sm"])
 
-        iy = 250
+        iy = 332
         ipx = px + 10
 
-        hearts_p = ("*" * world.player.hp + "." * (MAX_HP - world.player.hp))
-        hearts_a = ("*" * world.ai.hp + "." * (MAX_HP - world.ai.hp))
+        hearts_p = ("♥" * world.player.hp + "·" * (MAX_HP - world.player.hp))
+        hearts_a = ("♥" * world.ai.hp + "·" * (MAX_HP - world.ai.hp))
         wr = ai_wins / max(total_rounds, 1) * 100
 
+        # v3.0: 评估轮次标记
+        mode_str = mode
+        if is_eval:
+            mode_str += " [EVAL]"
+
         infos = [
-            ("Mode", mode, C_HIGHLIGHT if mode == "PvAI" else C_GOOD),
+            ("Mode", mode_str, C_HIGHLIGHT if mode == "PvAI" else C_GOOD),
             ("Round", f"{episode}", C_TEXT),
             ("Step", f"{world.step_count}/{MAX_ROUND_STEPS}", C_TEXT),
             ("P HP", hearts_p, C_PLAYER),
@@ -1316,18 +1435,15 @@ class Renderer:
             ("P Wins", f"{player_wins}", C_PLAYER),
             ("AI Wins", f"{ai_wins}", C_AI),
             ("WinRate", f"{wr:.1f}%", C_WARN),
-            ("Total", f"{total_rounds}", C_DIM),
+            ("Streak", f"{streak} (best:{best_streak})", C_GOOD),
             ("", "", C_TEXT),
             ("Epsilon", f"{epsilon:.4f}", C_TEXT),
             ("Loss", f"{loss:.5f}", C_TEXT),
+            ("LR", f"{lr_val:.6f}", C_DIM),
             ("Gate", f"{gate_val:.2f}", C_WARN),
             ("Gen", f"{strategy_gen}", C_GOOD),
             ("Speed", f"x{speed}", C_TEXT),
             ("FPS", f"{fps_val:.0f}", C_DIM),
-            ("", "", C_TEXT),
-            ("Tier", HW.tier, C_HIGHLIGHT),
-            ("Hidden", f"{HIDDEN_DIM}", C_DIM),
-            ("Batch", f"{BATCH_SIZE}", C_DIM),
         ]
         for label, val, color in infos:
             if label:
@@ -1336,24 +1452,25 @@ class Renderer:
                     (ipx, iy))
                 self.screen.blit(
                     self.fonts["sm"].render(str(val), True, color),
-                    (ipx + 70, iy))
-            iy += 14
-            
-    def draw_bottom(self, mode):
+                    (ipx + 60, iy))
+            iy += 13
+
+    def draw_bottom(self, mode, epsilon, global_step):
         by = ARENA_H
         pygame.draw.rect(self.screen, C_BOTTOM,
                          (0, by, WIN_W, BOTTOM_H))
         pygame.draw.line(self.screen, (50, 50, 80),
                          (0, by), (WIN_W, by), 2)
 
-        y1 = by + 8
-        y2 = by + 26
-        y3 = by + 44
-        y4 = by + 60
+        y1 = by + 6
+        y2 = by + 22
+        y3 = by + 38
+        y4 = by + 54
+        y5 = by + 68
 
         self.screen.blit(
             self.fonts["lg"].render(
-                f"Grid Duel Arena v{VERSION}  [{HW.tier}]",
+                f"Grid Duel Arena v{VERSION}[{HW.tier}]",
                 True, C_HIGHLIGHT),
             (10, y1))
 
@@ -1366,7 +1483,7 @@ class Renderer:
         self.screen.blit(
             self.fonts["sm"].render(
                 "[WASD]Move [J]Bomb [K]Stay "
-                "[S]Save [Tab]Help [Esc]Quit",
+                "[Ctrl+S]Save [Tab]Help [Esc]Quit",
                 True, C_DIM),
             (10, y3))
 
@@ -1375,9 +1492,26 @@ class Renderer:
             dev_str += f" ({HW.gpu_name[:25]}, {HW.vram_mb}MB)"
         self.screen.blit(
             self.fonts["sm"].render(
-                f"Mode:{mode} | {dev_str} | ReflexNet",
+                f"Mode:{mode} | {dev_str}",
                 True, C_DIM),
             (10, y4))
+
+        # v3.0: Epsilon进度条
+        prog_x = 10
+        prog_w = WIN_W - 20
+        prog_h = 6
+        prog_y = y5
+        pygame.draw.rect(self.screen, (30, 30, 50),
+                         (prog_x, prog_y, prog_w, prog_h))
+        progress = min(1.0, global_step / EPS_DECAY)
+        fill_w = int(prog_w * progress)
+        bar_color = C_GOOD if progress > 0.8 else C_WARN if progress > 0.4 else C_BAD
+        pygame.draw.rect(self.screen, bar_color,
+                         (prog_x, prog_y, fill_w, prog_h))
+        pct_txt = self.fonts["sm"].render(
+            f"Train: {progress * 100:.0f}% (ε={epsilon:.3f})", True, C_DIM)
+        self.screen.blit(pct_txt, (prog_x + prog_w + 5 - pct_txt.get_width(),
+                                   prog_y - 10))
 
     def draw_round_result(self, winner, p_wins, ai_wins, total):
         ov = pygame.Surface((ARENA_W, ARENA_H), pygame.SRCALPHA)
@@ -1402,13 +1536,13 @@ class Renderer:
                          (cx - title.get_width() // 2, cy - 50))
 
         score = self.fonts["md"].render(
-            f"Player {p_wins}:  {ai_wins} AI(of {total})",
+            f"Player {p_wins} : {ai_wins} AI(of {total})",
             True, C_TEXT)
         self.screen.blit(score,
                          (cx - score.get_width() // 2, cy + 10))
 
         hint = self.fonts["sm"].render(
-            "[N] Next Round|  [Esc] Quit", True, C_DIM)
+            "[N] Next Round  |  [Esc] Quit", True, C_DIM)
         self.screen.blit(hint,
                          (cx - hint.get_width() // 2, cy + 40))
 
@@ -1421,11 +1555,11 @@ class Renderer:
             (f"Grid Duel Arena v{VERSION}", C_HIGHLIGHT, "lg"),
             ("", C_TEXT, "sm"),
             ("--- Controls ---", C_WARN, "md"),
-            ("[WASD] Move player", C_TEXT, "md"),
+            ("[W/A/S/D] Move player", C_TEXT, "md"),
             ("[J] Place bomb  [K] Stay", C_TEXT, "md"),
             ("[Space] Pause  [Up/Down] Speed", C_TEXT, "md"),
             ("[1] PvAI  [2] SelfPlay  [3] FastTrain", C_TEXT, "md"),
-            ("[S] Save checkpoint", C_TEXT, "md"),
+            ("[Ctrl+S] Save checkpoint", C_TEXT, "md"),
             ("[Tab] Toggle this help", C_TEXT, "md"),
             ("[Esc] Save & quit", C_TEXT, "md"),
             ("", C_TEXT, "sm"),
@@ -1439,45 +1573,100 @@ class Renderer:
             ("  Dueling DQN + N-step + PER", C_DIM, "sm"),
             ("  Immune clone selection (strategy pool)", C_DIM, "sm"),
             ("", C_TEXT, "sm"),
+            ("--- v3.0 Upgrades ---", C_WARN, "md"),
+            ("  13-dim reward shaping", C_DIM, "sm"),
+            ("  Cosine LR schedule + warmup", C_DIM, "sm"),
+            ("  Q-value visualization", C_DIM, "sm"),
+            ("  Evaluation episodes every 25 rounds", C_DIM, "sm"),
+            ("  Curriculum opponent scheduling", C_DIM, "sm"),
+            ("", C_TEXT, "sm"),
             ("--- Hardware ---", C_WARN, "md"),
             (f"Device: {DEVICE}  Tier: {HW.tier}", C_TEXT, "md"),
-            (f"Hidden: {HIDDEN_DIM}  Batch: {BATCH_SIZE}"
+            (f"Hidden: {HIDDEN_DIM}  Batch: {BATCH_SIZE}  "
              f"Memory: {MEMORY_SIZE}", C_DIM, "sm"),
-            (f"AMP: {USE_AMP}  GradAccum: {GRAD_ACCUM}", C_DIM, "sm"),
+            (f"AMP: {USE_AMP}  GradAccum: {GRAD_ACCUM}  "
+             f"Warmup: {WARMUP_STEPS}", C_DIM, "sm"),
             ("", C_TEXT, "sm"),
             ("Press [Tab] to close", C_HIGHLIGHT, "md"),
         ]
-        y = 25
+        y = 20
         for text, color, font_key in lines:
             if text:
                 self.screen.blit(
                     self.fonts[font_key].render(text, True, color),
                     (30, y))
-            y += 20 if font_key != "lg" else 28
+            y += 18 if font_key != "lg" else 26
 
 
 # ╔════════════════════════════════════════════╗
-# ║          存档/ 加载 (兼容v1.0)             ║
+# ║          存档/加载 (兼容v1.0/v2.0)         ║
 # ╚════════════════════════════════════════════╝
 
 def migrate_weights(model, old_sd, label=""):
-    """安全加载权重，形状不匹配的层跳过"""
+    """安全加载权重：先精确匹配，再尝试按形状+层序推断偏移"""
     ns = model.state_dict()
     matched = 0
     skipped = 0
+    used_old_keys = set()
+
+    # 第一轮：精确键名+形状匹配
     for k in ns:
         if k in old_sd and old_sd[k].shape == ns[k].shape:
             ns[k] = old_sd[k]
             matched += 1
-        else:
-            skipped += 1
+            used_old_keys.add(k)
+
+    # 第二轮：对未匹配的层，按模块前缀+参数后缀+形状推断
+    unmatched_new = [k for k in ns if k not in used_old_keys and k not in old_sd]
+    unmatched_old = [k for k in old_sd if k not in used_old_keys]
+
+    if unmatched_new and unmatched_old:
+        # 按模块前缀分组 (如 "slow_net")
+        def get_prefix(k):
+            parts = k.rsplit(".", 2)
+            return parts[0] if len(parts) >= 3 else ""
+
+        def get_suffix(k):
+            return k.rsplit(".", 1)[-1]# "weight" or "bias"
+
+        from collections import defaultdict
+        new_by_prefix = defaultdict(list)
+        old_by_prefix = defaultdict(list)
+
+        for k in unmatched_new:
+            new_by_prefix[get_prefix(k)].append(k)
+        for k in unmatched_old:
+            old_by_prefix[get_prefix(k)].append(k)
+
+        for prefix in new_by_prefix:
+            if prefix not in old_by_prefix:
+                continue
+            new_keys = sorted(new_by_prefix[prefix])
+            old_keys = sorted(old_by_prefix[prefix])
+
+            # 按后缀(weight/bias)和形状配对
+            for nk in new_keys:
+                nsuf = get_suffix(nk)
+                nshape = ns[nk].shape
+                for ok in old_keys:
+                    if ok in used_old_keys:
+                        continue
+                    if get_suffix(ok) == nsuf and old_sd[ok].shape == nshape:
+                        ns[nk] = old_sd[ok]
+                        matched += 1
+                        used_old_keys.add(ok)
+                        break
+
+    skipped = len(ns) - matched
     model.load_state_dict(ns)
     if skipped > 0:
-        print(f"  🔄 {label}: {matched} matched, {skipped} adapted")
+        print(f"  🔄 {label}: {matched} matched, {skipped} re-initialized")
+    else:
+        print(f"  ✅ {label}: all {matched} layers matched")
     return matched, skipped
 
 
-def save_checkpoint(net, target_net, optimizer, memory, stats,
+def save_checkpoint(net, target_net, optimizer, scheduler, memory, stats,
                     pool, episode, best_reward):
     os.makedirs(CKPT_DIR, exist_ok=True)
     torch.save({
@@ -1491,6 +1680,7 @@ def save_checkpoint(net, target_net, optimizer, memory, stats,
         "net": net.state_dict(),
         "target": target_net.state_dict(),
         "optimizer": optimizer.state_dict(),
+        "scheduler": scheduler.state_dict(),
     }, CKPT_MODEL)
 
     stats_save = {}
@@ -1516,10 +1706,10 @@ def save_best(net, best_reward, episode):
         "hidden_dim": HIDDEN_DIM,
         "net": net.state_dict(),
     }, CKPT_BEST)
-    print(f"🏆 Best model R={best_reward:.1f}")
+    print(f"  🏆 Best model R={best_reward:.1f}")
 
 
-def load_checkpoint(net, target_net, optimizer, pool):
+def load_checkpoint(net, target_net, optimizer, scheduler, pool):
     default_stats = {
         "ai_wins": 0,
         "player_wins": 0,
@@ -1527,6 +1717,7 @@ def load_checkpoint(net, target_net, optimizer, pool):
         "rewards": [],
         "winrates": [],
         "losses": [],
+        "best_streak": 0,
     }
 
     if not os.path.exists(CKPT_MODEL):
@@ -1542,26 +1733,30 @@ def load_checkpoint(net, target_net, optimizer, pool):
     print(f"  📋 Checkpoint: v{old_ver}, hidden={old_hidden}, "
           f"current: v{VERSION}, hidden={HIDDEN_DIM}")
 
-    if old_hidden == HIDDEN_DIM:
+    if old_hidden == HIDDEN_DIM and old_ver == VERSION:
         net.load_state_dict(ckpt["net"])
         tgt = ckpt.get("target", ckpt["net"])
         target_net.load_state_dict(tgt)
         print(f"  ✅ Weights loaded perfectly (same architecture)")
     else:
-        print(f"🔄 Architecture changed "
-              f"(hidden {old_hidden} → {HIDDEN_DIM}), migrating...")
+        reason = f"hidden {old_hidden}→{HIDDEN_DIM}" if old_hidden != HIDDEN_DIM else f"v{old_ver}→v{VERSION}"
+        print(f"  🔄 Architecture changed ({reason}), migrating...")
         migrate_weights(net, ckpt["net"], "net")
         tgt = ckpt.get("target", ckpt["net"])
         migrate_weights(target_net, tgt, "target")
 
-    # 优化器
     if old_hidden == HIDDEN_DIM and old_ver == VERSION:
         try:
             optimizer.load_state_dict(ckpt["optimizer"])
         except Exception:
             print("  ⚠ Optimizer re-initialized")
-    else:
-        print("  ⚠ Optimizer re-initialized (architecture changed)")
+        if "scheduler" in ckpt:
+            try:
+                scheduler.load_state_dict(ckpt["scheduler"])
+            except Exception:
+                print("  ⚠ Scheduler re-initialized")
+        else:
+            print("  ⚠ Optimizer/Scheduler re-initialized (architecture changed)")
 
     pool.load(CKPT_POOL)
 
@@ -1667,18 +1862,16 @@ def rule_based_player(world):
 # ╚════════════════════════════════════════════╝
 
 class AMPContext:
-    """根据硬件自动选择是否用混合精度"""
-
     def __init__(self):
         self.use_amp = USE_AMP and DEVICE.type == "cuda"
         if self.use_amp:
-            self.scaler = torch.cuda.amp.GradScaler()
+            self.scaler = torch.amp.GradScaler("cuda")
         else:
             self.scaler = None
 
     def autocast(self):
         if self.use_amp:
-            return torch.cuda.amp.autocast()
+            return torch.amp.autocast("cuda")
         return NullContext()
 
     def scale_and_step(self, loss, optimizer, params, max_norm=10.0):
@@ -1734,6 +1927,11 @@ def main():
     target_net.eval()
 
     optimizer = optim.AdamW(net.parameters(), lr=LR, weight_decay=1e-5)
+
+    # v3.0: 余弦退火学习率调度
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=EPS_DECAY, eta_min=LR_MIN)
+
     memory = LightPER(MEMORY_SIZE)
     nstep = NStepBuffer(N_STEP, GAMMA)
     pool = StrategyPool(max_size=8)
@@ -1745,15 +1943,17 @@ def main():
 
     # ——— 加载 ———
     start_ep, best_reward, stats = load_checkpoint(
-        net, target_net, optimizer, pool)
+        net, target_net, optimizer, scheduler, pool)
 
     renderer = Renderer(screen, clock, fonts)
+
+    # v3.0修复: 各图表加载对应数据
     for v in stats.get("winrates", [])[-150:]:
         renderer.chart_winrate.add(v)
     for v in stats.get("rewards", [])[-150:]:
         renderer.chart_reward.add(v)
     for v in stats.get("losses", [])[-150:]:
-        renderer.chart_eps.add(v)
+        renderer.chart_loss.add(v)
 
     # ——— 状态 ———
     mode = "PvAI"
@@ -1768,6 +1968,13 @@ def main():
     draws = stats.get("draws", 0)
     total_rounds = player_wins + ai_wins + draws
     player_action_queue = 5
+    current_lr = LR
+
+    # v3.0: 连胜追踪
+    ai_streak = 0
+    best_streak = stats.get("best_streak", 0)
+
+    # v3.0: 梯度累积计数
     grad_accum_counter = 0
 
     print(f"\n  🏟️  Grid Duel Arena v{VERSION}")
@@ -1788,19 +1995,28 @@ def main():
 
         epsilon = max(EPS_END, EPS_START - global_step / EPS_DECAY)
 
-        # 对手选择
-        use_pool_opp = (mode in ("SelfPlay", "Train")
-                        and pool.pool
-                        and random.random() < 0.3)
-        if use_pool_opp:
-            opp = pool.sample_opponent()
-            try:
-                migrate_weights(opponent_net, opp[1], "opp")
-            except Exception:
-                use_pool_opp = False
-            opp_name = opp[0] if use_pool_opp else "Rule"
+        # v3.0: 评估轮次 (每EVAL_INTERVAL轮，epsilon=0)
+        is_eval = (episode % EVAL_INTERVAL == 0 and episode > 0 and mode in ("SelfPlay", "Train"))
+        if is_eval:
+            eval_epsilon = 0.0
         else:
-            opp_name = "Rule"
+            eval_epsilon = epsilon
+
+        # v3.0: 对手课程选择
+        use_pool_opp = False
+        opp_name = "Rule"
+        if mode in ("SelfPlay", "Train"):
+            # 前200轮主要用规则AI，之后逐渐增加策略池比例
+            pool_prob = min(0.5, episode / 1000.0) if pool.pool else 0.0
+            if random.random() < pool_prob:
+                opp = pool.sample_opponent()
+                if opp is not None:
+                    try:
+                        migrate_weights(opponent_net, opp[1], "opp")
+                        use_pool_opp = True
+                        opp_name = opp[0]
+                    except Exception:
+                        use_pool_opp = False
 
         round_running = True
         while round_running and running:
@@ -1827,23 +2043,29 @@ def main():
                         speed = 3
                     elif ev.key == pygame.K_3:
                         mode = "Train"
-                        speed = 15
+                        speed = max(speed, 10)
                     elif ev.key == pygame.K_TAB:
                         show_help = not show_help
                     elif ev.key == pygame.K_n and show_result:
                         round_running = False
                         continue
-                    elif ev.key == pygame.K_s and not show_result:
+                    # v3.0修复: Ctrl+S保存，不再与移动冲突
+                    elif (ev.key == pygame.K_s
+                          and (pygame.key.get_mods() & pygame.KMOD_CTRL)
+                          and not show_result):
                         stats["player_wins"] = player_wins
                         stats["ai_wins"] = ai_wins
                         stats["draws"] = draws
+                        stats["best_streak"] = best_streak
                         save_checkpoint(net, target_net, optimizer,
-                                        memory, stats, pool,
-                                        episode, best_reward)
-                    # 玩家操作 (PvAI模式)
+                                        scheduler, memory, stats,
+                                        pool, episode, best_reward)
+                    # v3.0修复: 玩家操作全部在此统一处理
                     if mode == "PvAI" and not show_result:
                         if ev.key == pygame.K_w:
                             player_action_queue = 0
+                        elif ev.key == pygame.K_s and not (pygame.key.get_mods() & pygame.KMOD_CTRL):
+                            player_action_queue = 1
                         elif ev.key == pygame.K_a:
                             player_action_queue = 2
                         elif ev.key == pygame.K_d:
@@ -1852,15 +2074,18 @@ def main():
                             player_action_queue = 4
                         elif ev.key == pygame.K_k:
                             player_action_queue = 5
+
             if not running:
                 break
 
-            # 持续按键检测 (改善操控手感)
+            # v3.0修复: 持续按键检测，S键不再触发保存
             if mode == "PvAI" and not show_result and not paused:
                 keys = pygame.key.get_pressed()
+                mods = pygame.key.get_mods()
+                ctrl_held = bool(mods & pygame.KMOD_CTRL)
                 if keys[pygame.K_w]:
                     player_action_queue = 0
-                elif keys[pygame.K_s]:
+                elif keys[pygame.K_s] and not ctrl_held:
                     player_action_queue = 1
                 elif keys[pygame.K_a]:
                     player_action_queue = 2
@@ -1872,13 +2097,15 @@ def main():
             # ——— 暂停 ———
             if paused and not show_result:
                 renderer.draw_arena(world)
-                renderer.draw_panel(world, episode, epsilon, last_loss, mode, speed,
-                                    ai_wins, player_wins,
-                                    total_rounds, gate_val,
-                                    pool.generation, fps_val)
-                renderer.draw_bottom(mode)
+                renderer.draw_panel(
+                    world, episode, eval_epsilon, last_loss, mode,
+                    speed, ai_wins, player_wins, total_rounds,
+                    gate_val, pool.generation, fps_val, current_lr,
+                    ai_streak, best_streak, is_eval)
+                renderer.draw_bottom(mode, eval_epsilon, global_step)
                 ptxt = fonts["lg"].render("PAUSED", True, C_WARN)
-                screen.blit(ptxt, (ARENA_W // 2 - ptxt.get_width() // 2, ARENA_H // 2 - ptxt.get_height() // 2))
+                screen.blit(ptxt, (ARENA_W // 2 - ptxt.get_width() // 2,
+                                   ARENA_H // 2 - ptxt.get_height() // 2))
                 if show_help:
                     renderer.draw_help_overlay()
                 pygame.display.flip()
@@ -1888,14 +2115,14 @@ def main():
             # ——— 结算画面 ———
             if show_result:
                 renderer.draw_arena(world)
-                renderer.draw_panel(world, episode, epsilon,
-                                    last_loss, mode, speed,
-                                    ai_wins, player_wins,
-                                    total_rounds, gate_val,
-                                    pool.generation, fps_val)
-                renderer.draw_bottom(mode)
-                renderer.draw_round_result(world.winner, player_wins, ai_wins,
-                                           total_rounds)
+                renderer.draw_panel(
+                    world, episode, eval_epsilon, last_loss, mode,
+                    speed, ai_wins, player_wins, total_rounds,
+                    gate_val, pool.generation, fps_val, current_lr,
+                    ai_streak, best_streak, is_eval)
+                renderer.draw_bottom(mode, eval_epsilon, global_step)
+                renderer.draw_round_result(world.winner, player_wins,
+                                           ai_wins, total_rounds)
                 if show_help:
                     renderer.draw_help_overlay()
                 pygame.display.flip()
@@ -1922,13 +2149,15 @@ def main():
                 p_act = rule_based_player(world)
 
             # ——— AI决策 ———
-            obs_t = torch.tensor(obs, dtype=torch.float32,
-                                 device=DEVICE).unsqueeze(0)
+            obs_t = torch.tensor(obs, dtype=torch.float32, device=DEVICE).unsqueeze(0)
             with torch.no_grad():
                 q_values = net(obs_t)
                 gate_val = net.get_gate_value(obs_t)
 
-            if random.random() < epsilon:
+            q_np = q_values.squeeze(0).cpu().numpy()
+            renderer.qbar.update(q_np)
+
+            if random.random() < eval_epsilon:
                 ai_act = random.randint(0, ACTION_DIM - 1)
             else:
                 ai_act = q_values.argmax(dim=-1).item()
@@ -1946,18 +2175,22 @@ def main():
             if world.ai.hp < prev_ai_hp:
                 renderer.add_hit_particles(world.ai.x, world.ai.y, C_AI)
             if world.player.hp < prev_player_hp:
-                renderer.add_hit_particles(world.player.x,
-                                           world.player.y, C_PLAYER)
+                renderer.add_hit_particles(world.player.x, world.player.y, C_PLAYER)
 
-            # 存储经验
-            nstep.push((obs, ai_act, reward, obs2, float(done)))
-            nt = nstep.get()
-            if nt:
-                memory.push(nt)
+            # 存储经验 (评估轮不存)
+            if not is_eval:
+                nstep.push((obs, ai_act, reward, obs2, float(done)))
+                nt = nstep.get()
+                if nt:
+                    memory.push(nt)
             obs = obs2
 
             # ——— 训练 ———
-            train_iters = TRAIN_PER_FRAME if not done else 1
+            # v3.0: 预热期检查
+            can_train = (len(memory) >= max(BATCH_SIZE, WARMUP_STEPS)
+                         and not is_eval)
+            train_iters = TRAIN_PER_FRAME if (not done and can_train) else (1 if can_train else 0)
+
             for _ in range(train_iters):
                 if len(memory) < BATCH_SIZE:
                     break
@@ -1985,25 +2218,51 @@ def main():
                     with torch.no_grad():
                         best_a = net(bs2).argmax(dim=-1, keepdim=True)
                         q_next = target_net(bs2).gather(1, best_a)
-                        target = (br + GAMMA ** N_STEP
-                                  * q_next * (1 - bd))
+                        target = br + GAMMA ** N_STEP * q_next * (1 - bd)
 
                     q_current = net(bs).gather(1, ba)
                     td_error = ((target - q_current)
                                 .detach().squeeze().cpu().numpy())
                     loss = (isw.unsqueeze(-1).to(DEVICE) * (q_current - target) ** 2).mean()
 
-                    if GRAD_ACCUM > 1:
-                        loss = loss / GRAD_ACCUM
+                # v3.0修复: 梯度累积正确实现
+                if GRAD_ACCUM > 1:
+                    loss = loss / GRAD_ACCUM
+                    grad_accum_counter += 1
 
-                optimizer.zero_grad()
-                amp_ctx.scale_and_step(loss, optimizer, net.parameters(), 10.0)
+                    if grad_accum_counter == 1:
+                        optimizer.zero_grad()
+
+                    if grad_accum_counter >= GRAD_ACCUM:
+                        amp_ctx.scale_and_step(
+                            loss, optimizer, net.parameters(), 10.0
+                        )
+                    else:
+                        loss.backward()
+
+                    if grad_accum_counter >= GRAD_ACCUM:
+                        if not amp_ctx.use_amp:
+                            nn.utils.clip_grad_norm_(
+                                net.parameters(), 10.0)
+                            optimizer.step()
+                        grad_accum_counter = 0
+                else:
+                    # 无梯度累积：正常流程
+                    optimizer.zero_grad()
+                    amp_ctx.scale_and_step(
+                        loss, optimizer, net.parameters(), 10.0)
+
                 memory.update_priorities(idx, td_error)
                 last_loss = loss.item() * (GRAD_ACCUM if GRAD_ACCUM > 1 else 1)
-                
-                # 软更新
-                for tp, sp in zip(target_net.parameters(), net.parameters()):
+
+                # 软更新 target network
+                for tp, sp in zip(target_net.parameters(),
+                                  net.parameters()):
                     tp.data.copy_(TAU * sp.data + (1 - TAU) * tp.data)
+
+                # v3.0: 学习率调度
+                scheduler.step()
+                current_lr = optimizer.param_groups[0]["lr"]
 
             # ——— 渲染 ———
             do_render = True
@@ -2012,12 +2271,12 @@ def main():
 
             if do_render:
                 renderer.draw_arena(world)
-                renderer.draw_panel(world, episode, epsilon,
-                                    last_loss, mode, speed,
-                                    ai_wins, player_wins,
-                                    total_rounds, gate_val,
-                                    pool.generation, fps_val)
-                renderer.draw_bottom(mode)
+                renderer.draw_panel(
+                    world, episode, eval_epsilon, last_loss, mode,
+                    speed, ai_wins, player_wins, total_rounds,
+                    gate_val, pool.generation, fps_val, current_lr,
+                    ai_streak, best_streak, is_eval)
+                renderer.draw_bottom(mode, eval_epsilon, global_step)
                 if show_help:
                     renderer.draw_help_overlay()
                 pygame.display.flip()
@@ -2029,18 +2288,24 @@ def main():
 
             # ——— 回合结束 ———
             if done:
-                for t in nstep.flush():
-                    memory.push(t)
+                if not is_eval:
+                    for t in nstep.flush():
+                        memory.push(t)
+
                 show_result = True
                 result_timer = 0
                 total_rounds += 1
 
                 if world.winner == "ai":
                     ai_wins += 1
+                    ai_streak += 1
+                    best_streak = max(best_streak, ai_streak)
                 elif world.winner == "player":
                     player_wins += 1
+                    ai_streak = 0
                 else:
                     draws += 1
+                    ai_streak = 0
 
                 wr = ai_wins / max(total_rounds, 1) * 100
                 stats.setdefault("rewards", []).append(total_reward)
@@ -2049,26 +2314,31 @@ def main():
 
                 renderer.chart_winrate.add(wr)
                 renderer.chart_reward.add(total_reward)
-                renderer.chart_eps.add(epsilon)
+                renderer.chart_eps.add(eval_epsilon)
+                renderer.chart_loss.add(last_loss)
 
                 winner_str = {
                     "ai": "AI WIN",
                     "player": "P WIN",
                     "draw": "DRAW",
                 }.get(world.winner, "?")
+                eval_tag = " [EVAL]" if is_eval else ""
 
                 print(f"EP {episode:5d}|"
-                      f"{winner_str:>6s}|"
+                      f"{winner_str:>6s}{eval_tag}|"
                       f"R:{total_reward:7.1f}|"
                       f"AI:{ai_wins} P:{player_wins}|"
                       f"WR:{wr:5.1f}%|"
-                      f"e:{epsilon:.3f}|"
+                      f"e:{eval_epsilon:.3f}|"
                       f"G:{gate_val:.2f}|"
+                      f"lr:{current_lr:.1e}|"
+                      f"Stk:{ai_streak}|"
                       f"Opp:{opp_name}|"
                       f"Mem:{len(memory)}")
 
                 # 策略池
-                if episode > 0 and episode % 20 == 0:
+                if (episode > 0 and episode % 20 == 0
+                        and not is_eval):
                     rr = stats["rewards"]
                     recent = rr[-20:] if len(rr) >= 20 else rr
                     fitness = sum(recent) / max(len(recent), 1)
@@ -2083,9 +2353,10 @@ def main():
                     stats["player_wins"] = player_wins
                     stats["ai_wins"] = ai_wins
                     stats["draws"] = draws
+                    stats["best_streak"] = best_streak
                     save_checkpoint(net, target_net, optimizer,
-                                    memory, stats, pool,
-                                    episode + 1, best_reward)
+                                    scheduler, memory, stats,
+                                    pool, episode + 1, best_reward)
 
                 episode += 1
 
@@ -2093,10 +2364,12 @@ def main():
     stats["player_wins"] = player_wins
     stats["ai_wins"] = ai_wins
     stats["draws"] = draws
-    save_checkpoint(net, target_net, optimizer, memory, stats,
-                    pool, episode, best_reward)
+    stats["best_streak"] = best_streak
+    save_checkpoint(net, target_net, optimizer, scheduler,
+                    memory, stats, pool, episode, best_reward)
     pygame.quit()
-    print("\n  👋 Game saved. Goodbye!")
+    print("\n👋 Game saved. Goodbye!")
+
 
 if __name__ == "__main__":
     main()
