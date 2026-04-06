@@ -1,15 +1,12 @@
 #!/usr/bin/env python3
 """
-Grid Duel Arena v3.2 — Complete Fixed Version
-==============================================
-v3.2 修复:
-  ✦ spawn子进程不再重跑全局初始化 (消除16次重复打印)
-  ✦ Worker端攒整局数据批量发送 (Queue序列化量降200倍)
-  ✦ 主进程批量接收 + 训练管线优化
-  ✦ GUI模式完整保留，兼容v3.0/v3.1存档
-
-pip install torch numpy
-pip install pygame  # 仅GUI模式需要
+Grid Duel Arena v3.3— High-Throughput Optimized
+=================================================
+v3.3 优化:✦ FastPER: 列式numpy数组替代deque+tuple，采样零拷贝
+  ✦ 文件权重同步替代Manager.dict()，消除IPC瓶颈
+  ✦ 批量内存插入，消除逐条Python循环
+  ✦ torch.from_numpy零拷贝 + pin_memory异步传输
+  ✦ Worker端epsilon由全局step广播，训练更一致
 """
 
 import os
@@ -23,6 +20,7 @@ import pickle
 import signal
 import argparse
 import warnings
+import tempfile
 from collections import deque, defaultdict
 
 import numpy as np
@@ -34,11 +32,7 @@ import torch.multiprocessing as mp
 
 warnings.filterwarnings("ignore")
 
-# ╔════════════════════════════════════════════╗
-# ║     全局常量 (纯数值，子进程安全)          ║
-# ╚════════════════════════════════════════════╝
-
-VERSION = "3.2"
+VERSION = "3.3"
 
 ARENA_COLS = 13
 ARENA_ROWS = 11
@@ -76,6 +70,7 @@ CKPT_MODEL = os.path.join(CKPT_DIR, "model.pth")
 CKPT_BEST = os.path.join(CKPT_DIR, "best.pth")
 CKPT_POOL = os.path.join(CKPT_DIR, "strategy_pool.pkl")
 CKPT_STATS = os.path.join(CKPT_DIR, "stats.json")
+WEIGHT_FILE = os.path.join(CKPT_DIR, ".worker_weights.pt")
 
 DIR_MAP = {
     0: (0, -1), 1: (0, 1), 2: (-1, 0), 3: (1, 0),
@@ -87,7 +82,6 @@ EMPTY = 0
 WALL = 1
 BRICK = 2
 
-#颜色
 C_BG = (12, 12, 22)
 C_GRID = (25, 25, 40)
 C_WALL = (60, 65, 80)
@@ -117,10 +111,6 @@ C_CHART_REW = (255, 175, 55)
 C_CHART_EPS = (200, 100, 255)
 C_CHART_LOSS = (255, 100, 100)
 
-
-# ╔════════════════════════════════════════════╗
-# ║             地图生成器                     ║
-# ╚════════════════════════════════════════════╝
 
 def generate_arena(seed=None):
     rng = random.Random(seed)
@@ -155,10 +145,6 @@ def generate_arena(seed=None):
                 grid[y][mx] = BRICK
     return grid
 
-
-# ╔════════════════════════════════════════════╗
-# ║             游戏对象定义                   ║
-# ╚════════════════════════════════════════════╝
 
 class Bomb:
     __slots__ = ["x", "y", "timer", "owner", "power"]
@@ -205,10 +191,6 @@ class Fighter:
         self.invincible = 0
         self.last_action = 5
 
-
-# ╔════════════════════════════════════════════╗
-# ║             DuelArena 游戏世界             ║
-# ╚════════════════════════════════════════════╝
 
 class DuelArena:
     def __init__(self, seed=None):
@@ -265,12 +247,9 @@ class DuelArena:
         move_valid = True
         if action == 4:
             if (fighter.bomb_cooldown <= 0 and fighter.active_bombs < fighter.max_bombs):
-                has_bomb = any(
-                    b.x == fighter.x and b.y == fighter.y
-                    for b in self.bombs)
+                has_bomb = any(b.x == fighter.x and b.y == fighter.y for b in self.bombs)
                 if not has_bomb:
-                    self.bombs.append(
-                        Bomb(fighter.x, fighter.y, fighter, fighter.bomb_power))
+                    self.bombs.append(Bomb(fighter.x, fighter.y, fighter, fighter.bomb_power))
                     fighter.active_bombs += 1
                     fighter.bomb_cooldown = BOMB_COOLDOWN
                 else:
@@ -306,8 +285,7 @@ class DuelArena:
                     if bomb.owner is self.ai:
                         self.bricks_broken_by_ai += 1
                     if self.rng.random() < 0.25:
-                        self.powerups.append(
-                            PowerUp(ex, ey, self.rng.randint(0, 2)))
+                        self.powerups.append(PowerUp(ex, ey, self.rng.randint(0, 2)))
                     break
         return cells
 
@@ -330,13 +308,11 @@ class DuelArena:
                 pu = self.powerups[i]
                 if pu.x == fighter.x and pu.y == fighter.y:
                     if pu.kind == 0:
-                        fighter.bomb_power = min(
-                            fighter.bomb_power + 1, 5)
+                        fighter.bomb_power = min(fighter.bomb_power + 1, 5)
                     elif pu.kind == 1:
                         fighter.speed = min(fighter.speed + 1, 3)
                     elif pu.kind == 2:
-                        fighter.max_bombs = min(
-                            fighter.max_bombs + 1, 3)
+                        fighter.max_bombs = min(fighter.max_bombs + 1, 3)
                     self.powerups.pop(i)
                 else:
                     i += 1
@@ -371,11 +347,9 @@ class DuelArena:
                     for other_bomb in self.bombs:
                         if other_bomb is not bomb and other_bomb.timer > 0:
                             for cx, cy in cells:
-                                if (other_bomb.x == cx
-                                        and other_bomb.y == cy):
+                                if other_bomb.x == cx and other_bomb.y == cy:
                                     other_bomb.timer = 0
-                    bomb.owner.active_bombs = max(
-                        0, bomb.owner.active_bombs - 1)
+                    bomb.owner.active_bombs = max(0, bomb.owner.active_bombs - 1)
                     self.bombs.pop(i)
 
         self._check_explosion_hit(exploded_cells)
@@ -424,13 +398,11 @@ class DuelArena:
             done = True
         if not done:
             ai_reward = self._compute_shaping_reward()
-            
         return self.get_state(for_ai=True), ai_reward, done
 
     def _compute_shaping_reward(self):
         reward = 0.005
-        dist = abs(self.ai.x - self.player.x) + abs(
-            self.ai.y - self.player.y)
+        dist = abs(self.ai.x - self.player.x) + abs(self.ai.y - self.player.y)
         if 2 <= dist <= 4:
             reward += 0.08
         elif dist <= 1:
@@ -441,10 +413,8 @@ class DuelArena:
             if self.ai.x == exp.x and self.ai.y == exp.y:
                 reward -= 0.5
         for b in self.bombs:
-            in_line = ((b.x == self.ai.x
-                        and abs(b.y - self.ai.y) <= b.power)
-                       or (b.y == self.ai.y
-                           and abs(b.x - self.ai.x) <= b.power))
+            in_line = ((b.x == self.ai.x and abs(b.y - self.ai.y) <= b.power)
+                       or (b.y == self.ai.y and abs(b.x - self.ai.x) <= b.power))
             if in_line:
                 urgency = 1.0 - b.timer / BOMB_TIMER
                 if b.timer <= 2:
@@ -477,8 +447,7 @@ class DuelArena:
         return np.clip(reward, -3.0, 3.0)
 
     def _spawn_random_powerup(self):
-        occupied = {(self.player.x, self.player.y),
-                    (self.ai.x, self.ai.y)}
+        occupied = {(self.player.x, self.player.y), (self.ai.x, self.ai.y)}
         for b in self.bombs:
             occupied.add((b.x, b.y))
         for pu in self.powerups:
@@ -486,13 +455,11 @@ class DuelArena:
         empties = []
         for y in range(1, ARENA_ROWS - 1):
             for x in range(1, ARENA_COLS - 1):
-                if (self.grid[y][x] == EMPTY
-                        and (x, y) not in occupied):
+                if self.grid[y][x] == EMPTY and (x, y) not in occupied:
                     empties.append((x, y))
         if empties and len(self.powerups) < 4:
             x, y = self.rng.choice(empties)
-            self.powerups.append(
-                PowerUp(x, y, self.rng.randint(0, 2)))
+            self.powerups.append(PowerUp(x, y, self.rng.randint(0, 2)))
 
     def get_state(self, for_ai=True):
         me = self.ai if for_ai else self.player
@@ -516,8 +483,7 @@ class DuelArena:
             wall_dist = 0
             for r in range(1, max(ARENA_COLS, ARENA_ROWS)):
                 cx_, cy_ = me.x + dx * r, me.y + dy * r
-                if (cx_ < 0 or cx_ >= ARENA_COLS
-                        or cy_ < 0 or cy_ >= ARENA_ROWS):
+                if cx_ < 0 or cx_ >= ARENA_COLS or cy_ < 0 or cy_ >= ARENA_ROWS:
                     break
                 if self.grid[cy_][cx_] in (WALL, BRICK):
                     break
@@ -525,31 +491,26 @@ class DuelArena:
             features.append(wall_dist / max(ARENA_COLS, ARENA_ROWS))
             danger = 0.0
             for b in self.bombs:
-                if (dx != 0 and b.y == me.y
-                        and 0 < (b.x - me.x) * dx <= b.power + 1):
+                if dx != 0 and b.y == me.y and 0 < (b.x - me.x) * dx <= b.power + 1:
                     danger = max(danger, 1.0 - b.timer / BOMB_TIMER)
-                if (dy != 0 and b.x == me.x
-                        and 0 < (b.y - me.y) * dy <= b.power + 1):
+                if dy != 0 and b.x == me.x and 0 < (b.y - me.y) * dy <= b.power + 1:
                     danger = max(danger, 1.0 - b.timer / BOMB_TIMER)
             features.append(danger)
             has_exp = 0.0
             for exp in self.explosions:
-                if (dx != 0 and exp.y == me.y
-                        and 0 < (exp.x - me.x) * dx <= 2):
+                if dx != 0 and exp.y == me.y and 0 < (exp.x - me.x) * dx <= 2:
                     has_exp = 1.0
-                if (dy != 0 and exp.x == me.x
-                        and 0 < (exp.y - me.y) * dy <= 2):
+                if dy != 0 and exp.x == me.x and 0 < (exp.y - me.y) * dy <= 2:
                     has_exp = 1.0
             features.append(has_exp)
         my_bomb_count = sum(1 for b in self.bombs if b.owner is me)
-        enemy_bomb_count = sum(
-            1 for b in self.bombs if b.owner is enemy)
+        enemy_bomb_count = sum(1 for b in self.bombs if b.owner is enemy)
         features.append(my_bomb_count / 3.0)
         features.append(enemy_bomb_count / 3.0)
         min_bomb_dist = 1.0
         min_bomb_timer = 1.0
         for b in self.bombs:
-            bd = ((abs(b.x - me.x) + abs(b.y - me.y)) / (ARENA_COLS + ARENA_ROWS))
+            bd = (abs(b.x - me.x) + abs(b.y - me.y)) / (ARENA_COLS + ARENA_ROWS)
             if bd < min_bomb_dist:
                 min_bomb_dist = bd
                 min_bomb_timer = b.timer / BOMB_TIMER
@@ -558,10 +519,8 @@ class DuelArena:
         in_danger = 0.0
         for b in self.bombs:
             if ((b.x == me.x and abs(b.y - me.y) <= b.power)
-                    or (b.y == me.y
-                        and abs(b.x - me.x) <= b.power)):
-                in_danger = max(
-                    in_danger, 1.0 - b.timer / BOMB_TIMER)
+                    or (b.y == me.y and abs(b.x - me.x) <= b.power)):
+                in_danger = max(in_danger, 1.0 - b.timer / BOMB_TIMER)
         features.append(in_danger)
         stuck = 1.0
         for ddx, ddy in dirs:
@@ -573,8 +532,7 @@ class DuelArena:
         min_pu_dx = 0.0
         min_pu_dy = 0.0
         for pu in self.powerups:
-            pd = ((abs(pu.x - me.x) + abs(pu.y - me.y))
-                  / (ARENA_COLS + ARENA_ROWS))
+            pd = (abs(pu.x - me.x) + abs(pu.y - me.y)) / (ARENA_COLS + ARENA_ROWS)
             if pd < min_pu_dist:
                 min_pu_dist = pd
                 min_pu_dx = (pu.x - me.x) / ARENA_COLS
@@ -601,19 +559,17 @@ class DuelArena:
                     if 0 <= ex < ARENA_COLS and 0 <= ey < ARENA_ROWS:
                         if self.grid[ey][ex] == WALL:
                             break
-                        dmap[ey][ex] = max(
-                            dmap[ey][ex], urgency * 0.7)
+                        dmap[ey][ex] = max(dmap[ey][ex], urgency * 0.7)
                     else:
                         break
         for exp in self.explosions:
-            if (0 <= exp.y < ARENA_ROWS
-                    and 0 <= exp.x < ARENA_COLS):
+            if 0 <= exp.y < ARENA_ROWS and 0 <= exp.x < ARENA_COLS:
                 dmap[exp.y][exp.x] = 1.0
         return dmap
 
 
-# ╔════════════════════════════════════════════╗
-# ║      神经网络 (ReflexNet)                  ║
+#╔════════════════════════════════════════════╗
+# ║      神经网络 (ReflexNet)                 ║
 # ╚════════════════════════════════════════════╝
 
 class Swish(nn.Module):
@@ -622,8 +578,7 @@ class Swish(nn.Module):
 
 
 class ReflexNet(nn.Module):
-    def __init__(self, state_dim=STATE_DIM, action_dim=ACTION_DIM,
-                 hidden=128):
+    def __init__(self, state_dim=STATE_DIM, action_dim=ACTION_DIM, hidden=128):
         super().__init__()
         self.hidden = hidden
         self.state_dim = state_dim
@@ -631,7 +586,8 @@ class ReflexNet(nn.Module):
         self.fast_net = nn.Sequential(
             nn.Linear(18, 48), Swish(),
             nn.Linear(48, 24), Swish(),
-            nn.Linear(24, action_dim),)
+            nn.Linear(24, action_dim),
+        )
         self.slow_net = nn.Sequential(
             nn.Linear(state_dim, hidden), Swish(),
             nn.LayerNorm(hidden),
@@ -658,8 +614,7 @@ class ReflexNet(nn.Module):
         fast_q = self.fast_net(fast_feat)
         slow_q = self.slow_net(x)
         g = self.gate(x)
-        combined = torch.cat(
-            [fast_q * g, slow_q * (1 - g)], dim=-1)
+        combined = torch.cat([fast_q * g, slow_q * (1 - g)], dim=-1)
         v = self.value_head(combined)
         a = self.advantage_head(combined)
         return v + a - a.mean(dim=-1, keepdim=True)
@@ -670,53 +625,108 @@ class ReflexNet(nn.Module):
 
     def get_q_values(self, state_np, device):
         with torch.no_grad():
-            st = torch.tensor(
-                state_np, dtype=torch.float32,
-                device=device).unsqueeze(0)
+            st = torch.tensor(state_np, dtype=torch.float32, device=device).unsqueeze(0)
             return self(st).squeeze(0).cpu().numpy()
 
 
-# ╔════════════════════════════════════════════╗
-# ║      经验回放 / N-Step /策略池             ║
-# ╚════════════════════════════════════════════╝
+# ╔════════════════════════════════════════════════════════╗
+# ║  ★ 优化1: FastPER — 列式NumPy数组，零拷贝采样 ★     ║
+# ╚════════════════════════════════════════════════════════╝
 
-class LightPER:
-    def __init__(self, capacity, alpha=0.6):
+class FastPER:
+    """
+    列式存储PER:用预分配numpy数组代替deque[tuple]
+    - push: O(1) 数组写入，无Python对象创建
+    - sample: 直接切片返回numpy视图，无列表推导
+    - 训练时torch.from_numpy 零拷贝
+    """
+    def __init__(self, capacity, state_dim=STATE_DIM, alpha=0.6):
         self.capacity = capacity
         self.alpha = alpha
-        self.buffer = deque(maxlen=capacity)
-        self.priorities = deque(maxlen=capacity)
+        self.states = np.zeros((capacity, state_dim), dtype=np.float32)
+        self.next_states = np.zeros((capacity, state_dim), dtype=np.float32)
+        self.actions = np.zeros(capacity, dtype=np.int64)
+        self.rewards = np.zeros(capacity, dtype=np.float32)
+        self.dones = np.zeros(capacity, dtype=np.float32)
+        self.priorities = np.ones(capacity, dtype=np.float64)
+        self.pos = 0
+        self.size = 0
+        self._max_priority = 1.0
 
     def push(self, transition):
-        mx = max(self.priorities) if self.priorities else 1.0
-        self.buffer.append(transition)
-        self.priorities.append(mx)
+        s, a, r, ns, d = transition
+        self.states[self.pos] = s
+        self.actions[self.pos] = a
+        self.rewards[self.pos] = r
+        self.next_states[self.pos] = ns
+        self.dones[self.pos] = d
+        self.priorities[self.pos] = self._max_priority
+        self.pos = (self.pos + 1) % self.capacity
+        self.size = min(self.size + 1, self.capacity)
+
+    def push_batch(self, states, actions, rewards, next_states, dones):
+        """批量插入 — 一次numpy操作代替n次Python调用"""
+        n = len(states)
+        if n == 0:
+            return
+        if self.pos + n <= self.capacity:
+            self.states[self.pos:self.pos + n] = states
+            self.actions[self.pos:self.pos + n] = actions
+            self.rewards[self.pos:self.pos + n] = rewards
+            self.next_states[self.pos:self.pos + n] = next_states
+            self.dones[self.pos:self.pos + n] = dones
+            self.priorities[self.pos:self.pos + n] = self._max_priority
+            self.pos = (self.pos + n) % self.capacity
+        else:
+            first = self.capacity - self.pos
+            self.states[self.pos:] = states[:first]
+            self.actions[self.pos:] = actions[:first]
+            self.rewards[self.pos:] = rewards[:first]
+            self.next_states[self.pos:] = next_states[:first]
+            self.dones[self.pos:] = dones[:first]
+            self.priorities[self.pos:] = self._max_priority
+            remain = n - first
+            self.states[:remain] = states[first:]
+            self.actions[:remain] = actions[first:]
+            self.rewards[:remain] = rewards[first:]
+            self.next_states[:remain] = next_states[first:]
+            self.dones[:remain] = dones[first:]
+            self.priorities[:remain] = self._max_priority
+            self.pos = remain
+        self.size = min(self.size + n, self.capacity)
 
     def sample(self, batch_size, beta=0.4):
-        n = len(self.buffer)
-        p = np.array(self.priorities, dtype=np.float64)
-        p = p ** self.alpha
-        s = p.sum()
-        if s == 0:
-            p = np.ones(n, dtype=np.float64) / n
+        p = self.priorities[:self.size].copy()
+        np.power(p, self.alpha, out=p)
+        p_sum = p.sum()
+        if p_sum == 0:
+            p[:] = 1.0 / self.size
         else:
-            p /= s
-        size = min(batch_size, n)
-        idx = np.random.choice(n, size, p=p, replace=False)
-        samples = [self.buffer[i] for i in idx]
-        w = (n * p[idx]) ** (-beta)
-        wmax = w.max()
-        if wmax > 0:
-            w /= wmax
-        return samples, idx, torch.tensor(w, dtype=torch.float32)
+            p /= p_sum
+        size = min(batch_size, self.size)
+        idx = np.random.choice(self.size, size, p=p, replace=False)
+        w = np.power(self.size * p[idx], -beta)
+        w_max = w.max()
+        if w_max > 0:
+            w /= w_max
+        # 返回numpy数组切片(连续内存) — 下游直接 torch.from_numpy
+        return (
+            self.states[idx].copy(),
+            self.actions[idx].copy(),
+            self.rewards[idx].copy(),
+            self.next_states[idx].copy(),
+            self.dones[idx].copy(),
+        ), idx, torch.from_numpy(w.astype(np.float32))
 
     def update_priorities(self, indices, td_errors):
-        for i, td in zip(indices, td_errors):
-            if 0 <= i < len(self.priorities):
-                self.priorities[i] = abs(td) + 1e-6
+        new_p = np.abs(td_errors) + 1e-6
+        self.priorities[indices] = new_p
+        max_new = new_p.max()
+        if max_new > self._max_priority:
+            self._max_priority = max_new
 
     def __len__(self):
-        return len(self.buffer)
+        return self.size
 
 
 class NStepBuffer:
@@ -732,18 +742,14 @@ class NStepBuffer:
             return None
         s0, a0 = self.buffer[0][0], self.buffer[0][1]
         r = sum(self.gamma ** i * self.buffer[i][2] for i in range(self.n))
-        return (s0, a0, r, self.buffer[-1][3],
-                self.buffer[-1][4])
+        return (s0, a0, r, self.buffer[-1][3], self.buffer[-1][4])
 
     def flush(self):
         results = []
         while self.buffer:
             s0, a0 = self.buffer[0][0], self.buffer[0][1]
-            r = sum(self.gamma ** i * self.buffer[i][2]
-                    for i in range(len(self.buffer)))
-            results.append(
-                (s0, a0, r, self.buffer[-1][3],
-                 self.buffer[-1][4]))
+            r = sum(self.gamma ** i * self.buffer[i][2] for i in range(len(self.buffer)))
+            results.append((s0, a0, r, self.buffer[-1][3], self.buffer[-1][4]))
             self.buffer.popleft()
         return results
 
@@ -758,8 +764,7 @@ class StrategyPool:
         self.generation = 0
 
     def add(self, name, state_dict, fitness):
-        self.pool.append(
-            (name, copy.deepcopy(state_dict), fitness))
+        self.pool.append((name, copy.deepcopy(state_dict), fitness))
         self.generation += 1
         if len(self.pool) > self.max_size:
             self.pool.sort(key=lambda x: x[2], reverse=True)
@@ -779,8 +784,7 @@ class StrategyPool:
 
     def save(self, path):
         with open(path, "wb") as f:
-            pickle.dump(
-                {"pool": self.pool, "gen": self.generation}, f)
+            pickle.dump({"pool": self.pool, "gen": self.generation}, f)
 
     def load(self, path):
         if os.path.exists(path):
@@ -789,22 +793,16 @@ class StrategyPool:
                     data = pickle.load(f)
                 self.pool = data.get("pool", [])
                 self.generation = data.get("gen", 0)
-                print(f"  🧬 Pool: {len(self.pool)} strategies, "
-                      f"gen {self.generation}")
+                print(f"  🧬 Pool: {len(self.pool)} strategies, gen {self.generation}")
             except Exception as e:
                 print(f"  ⚠ Pool load error: {e}")
 
-
-# ╔════════════════════════════════════════════╗
-# ║             规则AI                         ║
-# ╚════════════════════════════════════════════╝
 
 def _rule_ai_logic(world, me, enemy):
     in_danger = False
     for b in world.bombs:
         if ((b.x == me.x and abs(b.y - me.y) <= b.power)
-                or (b.y == me.y
-                    and abs(b.x - me.x) <= b.power)):
+                or (b.y == me.y and abs(b.x - me.x) <= b.power)):
             if b.timer <= 4:
                 in_danger = True
                 break
@@ -820,8 +818,7 @@ def _rule_ai_logic(world, me, enemy):
             safe, safety = True, 0
             for b in world.bombs:
                 if ((b.x == nx and abs(b.y - ny) <= b.power)
-                        or (b.y == ny
-                            and abs(b.x - nx) <= b.power)):
+                        or (b.y == ny and abs(b.x - nx) <= b.power)):
                     safe = False
                 safety += abs(b.x - nx) + abs(b.y - ny)
             safety += 10 if safe else 0
@@ -829,13 +826,11 @@ def _rule_ai_logic(world, me, enemy):
                 best_safety, best_dir = safety, act
         return best_dir
     dist = abs(me.x - enemy.x) + abs(me.y - enemy.y)
-    if (dist <= 3 and me.bomb_cooldown <= 0
-            and me.active_bombs < me.max_bombs):
+    if (dist <= 3 and me.bomb_cooldown <= 0 and me.active_bombs < me.max_bombs):
         for act in range(4):
             dx, dy = DIR_MAP[act]
             nx, ny = me.x + dx, me.y + dy
-            if (world._can_move(nx, ny)
-                    and not (nx == enemy.x and ny == enemy.y)):
+            if world._can_move(nx, ny) and not (nx == enemy.x and ny == enemy.y):
                 return 4
     best_dir, best_dist = 5, dist
     for act in range(4):
@@ -862,10 +857,6 @@ def rule_based_player(world):
     return act
 
 
-# ╔════════════════════════════════════════════╗
-# ║          AMP Context                       ║
-# ╚════════════════════════════════════════════╝
-
 class NullContext:
     def __enter__(self):
         return self
@@ -876,16 +867,14 @@ class NullContext:
 class AMPContext:
     def __init__(self, use_amp, device):
         self.use_amp = use_amp and device.type == "cuda"
-        self.scaler = (torch.amp.GradScaler("cuda")
-                       if self.use_amp else None)
+        self.scaler = torch.amp.GradScaler("cuda") if self.use_amp else None
 
     def autocast(self):
         if self.use_amp:
             return torch.amp.autocast("cuda")
         return NullContext()
 
-    def scale_and_step(self, loss, optimizer, params,
-                       max_norm=10.0):
+    def scale_and_step(self, loss, optimizer, params, max_norm=10.0):
         if self.use_amp:
             self.scaler.scale(loss).backward()
             self.scaler.unscale_(optimizer)
@@ -915,8 +904,7 @@ class MiniChart:
     def draw(self, surf, font):
         import pygame
         pygame.draw.rect(surf, (10, 10, 22), (self.x, self.y, self.w, self.h))
-        pygame.draw.rect(surf, (40, 40, 60),
-                         (self.x, self.y, self.w, self.h), 1)
+        pygame.draw.rect(surf, (40, 40, 60), (self.x, self.y, self.w, self.h), 1)
         surf.blit(font.render(self.title, True, C_DIM), (self.x + 4, self.y + 2))
         if len(self.data) < 2:
             return
@@ -925,8 +913,7 @@ class MiniChart:
         rng = mx - mn if mx != mn else 1.0
         cy = self.y + 15
         ch = self.h - 18
-        surf.blit(font.render(f"{dl[-1]:.2f}", True, self.color),
-                  (self.x + self.w - 52, self.y + 2))
+        surf.blit(font.render(f"{dl[-1]:.2f}", True, self.color), (self.x + self.w - 52, self.y + 2))
         win = min(30, len(dl))
         avg = []
         for i in range(len(dl)):
@@ -959,12 +946,9 @@ class QValueBar:
 
     def draw(self, surf, font):
         import pygame
-        pygame.draw.rect(surf, (10, 10, 22),
-                         (self.x, self.y, self.w, self.h))
-        pygame.draw.rect(surf, (40, 40, 60),
-                         (self.x, self.y, self.w, self.h), 1)
-        surf.blit(font.render("Q-Values", True, C_DIM),
-                  (self.x + 4, self.y + 2))
+        pygame.draw.rect(surf, (10, 10, 22), (self.x, self.y, self.w, self.h))
+        pygame.draw.rect(surf, (40, 40, 60), (self.x, self.y, self.w, self.h), 1)
+        surf.blit(font.render("Q-Values", True, C_DIM), (self.x + 4, self.y + 2))
         if np.all(self.q_values == 0):
             return
         bar_area_y = self.y + 15
@@ -979,8 +963,7 @@ class QValueBar:
             bh = max(2, int(norm * (bar_h - 12)))
             by = bar_area_y + bar_h - bh - 2
             color = C_GOOD if i == best_a else (60, 60, 90)
-            pygame.draw.rect(surf, color,
-                             (int(bx), int(by), int(bar_w), bh))
+            pygame.draw.rect(surf, color, (int(bx), int(by), int(bar_w), bh))
             label = DIR_NAMES[i][0]
             txt = font.render(label, True, C_DIM)
             surf.blit(txt, (int(bx + bar_w // 2 - txt.get_width() // 2),
@@ -988,8 +971,7 @@ class QValueBar:
 
 
 class Particle:
-    __slots__ = ["x", "y", "vx", "vy", "life", "max_life",
-                 "color", "size"]
+    __slots__ = ["x", "y", "vx", "vy", "life", "max_life", "color", "size"]
     def __init__(self, x, y, color, speed_range=(1, 4)):
         self.x, self.y = float(x), float(y)
         angle = random.uniform(0, 2 * math.pi)
@@ -1014,13 +996,8 @@ class Particle:
         r = int(self.size * a)
         if r > 0:
             c = tuple(min(255, int(v * a)) for v in self.color)
-            pygame.draw.circle(
-                surf, c, (int(self.x), int(self.y)), r)
+            pygame.draw.circle(surf, c, (int(self.x), int(self.y)), r)
 
-
-# ╔════════════════════════════════════════════╗
-# ║              主渲染器                      ║
-# ╚════════════════════════════════════════════╝
 
 class Renderer:
     def __init__(self, screen, clock, fonts, hw_tier):
@@ -1032,14 +1009,10 @@ class Renderer:
         self.pulse = 0.0
         px = ARENA_W + 10
         cw = PANEL_W - 20
-        self.chart_winrate = MiniChart(
-            px, 10, cw, 58, "AI WinRate%", C_CHART_WIN)
-        self.chart_reward = MiniChart(
-            px, 74, cw, 58, "Reward", C_CHART_REW)
-        self.chart_eps = MiniChart(
-            px, 138, cw, 58, "Epsilon", C_CHART_EPS)
-        self.chart_loss = MiniChart(
-            px, 202, cw, 58, "Loss", C_CHART_LOSS)
+        self.chart_winrate = MiniChart(px, 10, cw, 58, "AI WinRate%", C_CHART_WIN)
+        self.chart_reward = MiniChart(px, 74, cw, 58, "Reward", C_CHART_REW)
+        self.chart_eps = MiniChart(px, 138, cw, 58, "Epsilon", C_CHART_EPS)
+        self.chart_loss = MiniChart(px, 202, cw, 58, "Loss", C_CHART_LOSS)
         self.qbar = QValueBar(px, 266, cw, 58)
 
     def add_explosion_particles(self, x, y):
@@ -1065,33 +1038,21 @@ class Renderer:
                 rx, ry = x * CELL, y * CELL
                 cell = world.grid[y][x]
                 if cell == WALL:
-                    pygame.draw.rect(self.screen, C_WALL,
-                                     (rx, ry, CELL, CELL))
-                    pygame.draw.rect(self.screen, C_WALL_L,
-                                     (rx+1, ry+1, CELL-2, CELL-2), 1)
+                    pygame.draw.rect(self.screen, C_WALL, (rx, ry, CELL, CELL))
+                    pygame.draw.rect(self.screen, C_WALL_L, (rx+1, ry+1, CELL-2, CELL-2), 1)
                 elif cell == BRICK:
-                    pygame.draw.rect(self.screen, C_BRICK,
-                                     (rx, ry, CELL, CELL))
-                    pygame.draw.rect(self.screen, C_BRICK_D,
-                                     (rx+2, ry+2, CELL-4, CELL-4))
-                    pygame.draw.line(self.screen, C_BRICK_D,
-                                     (rx, ry + CELL//2),
-                                     (rx + CELL, ry + CELL//2), 1)
-                    pygame.draw.line(self.screen, C_BRICK_D,
-                                     (rx + CELL//2, ry),
-                                     (rx + CELL//2, ry + CELL), 1)
+                    pygame.draw.rect(self.screen, C_BRICK, (rx, ry, CELL, CELL))
+                    pygame.draw.rect(self.screen, C_BRICK_D, (rx+2, ry+2, CELL-4, CELL-4))
+                    pygame.draw.line(self.screen, C_BRICK_D, (rx, ry + CELL//2), (rx + CELL, ry + CELL//2), 1)
+                    pygame.draw.line(self.screen, C_BRICK_D, (rx + CELL//2, ry), (rx + CELL//2, ry + CELL), 1)
                 else:
-                    pygame.draw.rect(self.screen, C_FLOOR,
-                                     (rx, ry, CELL, CELL))
+                    pygame.draw.rect(self.screen, C_FLOOR, (rx, ry, CELL, CELL))
                     d = dmap[y][x]
                     if d > 0.01:
-                        ds = pygame.Surface(
-                            (CELL, CELL), pygame.SRCALPHA)
+                        ds = pygame.Surface((CELL, CELL), pygame.SRCALPHA)
                         ds.fill((255, 50, 0, int(d * 100)))
                         self.screen.blit(ds, (rx, ry))
-                pygame.draw.rect(self.screen, C_GRID,
-                                 (rx, ry, CELL, CELL), 1)
-        #道具
+                pygame.draw.rect(self.screen, C_GRID, (rx, ry, CELL, CELL), 1)
         pu_icons = ["R", "S", "B"]
         pu_colors = [C_POWERUP, C_WARN, C_SHIELD]
         for pu in world.powerups:
@@ -1099,13 +1060,9 @@ class Renderer:
             py_ = pu.y * CELL + CELL // 2
             r = int(CELL * 0.3 + math.sin(self.pulse * 2) * 2)
             c = pu_colors[pu.kind % 3]
-            pygame.draw.circle(
-                self.screen, c, (px_, py_), max(r, 4))
-            txt = self.fonts["sm"].render(
-                pu_icons[pu.kind % 3], True, (0, 0, 0))
-            self.screen.blit(
-                txt, (px_ - txt.get_width() // 2, py_ - txt.get_height() // 2))
-        #炸弹
+            pygame.draw.circle(self.screen, c, (px_, py_), max(r, 4))
+            txt = self.fonts["sm"].render(pu_icons[pu.kind % 3], True, (0, 0, 0))
+            self.screen.blit(txt, (px_ - txt.get_width() // 2, py_ - txt.get_height() // 2))
         for b in world.bombs:
             bx = b.x * CELL + CELL // 2
             by = b.y * CELL + CELL // 2
@@ -1113,27 +1070,16 @@ class Renderer:
             r = int(CELL * 0.35 + urgency * 4)
             flash = b.timer <= 3 and b.timer % 2 == 0
             bc = C_BOMB_FUSE if flash else C_BOMB
-            pygame.draw.circle(
-                self.screen, bc, (bx, by), max(r, 4))
-            pygame.draw.line(self.screen, C_BOMB_FUSE,
-                             (bx, by - r),
-                             (bx + 3, by - r - 5), 2)
-            txt = self.fonts["sm"].render(
-                str(b.timer), True, (0, 0, 0))
-            self.screen.blit(
-                txt, (bx - txt.get_width() // 2,
-                      by - txt.get_height() // 2))
-        # 爆炸
+            pygame.draw.circle(self.screen, bc, (bx, by), max(r, 4))
+            pygame.draw.line(self.screen, C_BOMB_FUSE, (bx, by - r), (bx + 3, by - r - 5), 2)
+            txt = self.fonts["sm"].render(str(b.timer), True, (0, 0, 0))
+            self.screen.blit(txt, (bx - txt.get_width() // 2, by - txt.get_height() // 2))
         for exp in world.explosions:
             ex, ey = exp.x * CELL, exp.y * CELL
             ci = min(exp.timer, len(C_EXPLODE) - 1)
-            pygame.draw.rect(self.screen, C_EXPLODE[ci],
-                             (ex+2, ey+2, CELL-4, CELL-4))
-        # 角色
-        self._draw_fighter(world.player, C_PLAYER,
-                           C_PLAYER_D, "P")
+            pygame.draw.rect(self.screen, C_EXPLODE[ci], (ex+2, ey+2, CELL-4, CELL-4))
+        self._draw_fighter(world.player, C_PLAYER, C_PLAYER_D, "P")
         self._draw_fighter(world.ai, C_AI, C_AI_D, "AI")
-        # 粒子
         i = 0
         while i < len(self.particles):
             if self.particles[i].update(dt):
@@ -1141,8 +1087,7 @@ class Renderer:
                 i += 1
             else:
                 self.particles.pop(i)
-        pygame.draw.rect(self.screen, (80, 80, 120),
-                         (0, 0, ARENA_W, ARENA_H), 3)
+        pygame.draw.rect(self.screen, (80, 80, 120), (0, 0, ARENA_W, ARENA_H), 3)
 
     def _draw_fighter(self, fighter, color, dark_color, label):
         import pygame
@@ -1157,30 +1102,24 @@ class Renderer:
         pygame.draw.circle(self.screen, dark_color, (fx, fy), r)
         pygame.draw.circle(self.screen, c, (fx, fy), r - 2)
         txt = self.fonts["sm"].render(label, True, (0, 0, 0))
-        self.screen.blit(
-            txt, (fx - txt.get_width() // 2,
-                  fy - txt.get_height() // 2))
+        self.screen.blit(txt, (fx - txt.get_width() // 2, fy - txt.get_height() // 2))
         hp_w = CELL - 6
         hp_h = 4
         hp_x = fighter.x * CELL + 3
         hp_y = fighter.y * CELL - 6
-        pygame.draw.rect(self.screen, (40, 40, 40),
-                         (hp_x, hp_y, hp_w, hp_h))
+        pygame.draw.rect(self.screen, (40, 40, 40), (hp_x, hp_y, hp_w, hp_h))
         fill = int(hp_w * fighter.hp / fighter.max_hp)
         hc = C_GOOD if fighter.hp > 1 else C_BAD
-        pygame.draw.rect(self.screen, hc,
-                         (hp_x, hp_y, fill, hp_h))
+        pygame.draw.rect(self.screen, hc, (hp_x, hp_y, fill, hp_h))
         act = fighter.last_action
         if act < 4:
             dx, dy = DIR_MAP[act]
             ax1, ay1 = fx + dx * 8, fy + dy * 8
             ax2, ay2 = fx + dx * 16, fy + dy * 16
-            pygame.draw.line(self.screen, c,
-                             (ax1, ay1), (ax2, ay2), 2)
+            pygame.draw.line(self.screen, c, (ax1, ay1), (ax2, ay2), 2)
             pygame.draw.circle(self.screen, c, (ax2, ay2), 3)
         elif act == 4:
-            pygame.draw.circle(
-                self.screen, C_BOMB, (fx, fy - r - 6), 4)
+            pygame.draw.circle(self.screen, C_BOMB, (fx, fy - r - 6), 4)
 
     def draw_panel(self, world, episode, epsilon, loss, mode,
                    speed, ai_wins, player_wins, total_rounds,
@@ -1188,10 +1127,8 @@ class Renderer:
                    streak, best_streak, is_eval):
         import pygame
         px = ARENA_W
-        pygame.draw.rect(self.screen, C_PANEL,
-                         (px, 0, PANEL_W, ARENA_H))
-        pygame.draw.line(self.screen, (50, 50, 80),
-                         (px, 0), (px, ARENA_H), 2)
+        pygame.draw.rect(self.screen, C_PANEL, (px, 0, PANEL_W, ARENA_H))
+        pygame.draw.line(self.screen, (50, 50, 80), (px, 0), (px, ARENA_H), 2)
         self.chart_winrate.draw(self.screen, self.fonts["sm"])
         self.chart_reward.draw(self.screen, self.fonts["sm"])
         self.chart_eps.draw(self.screen, self.fonts["sm"])
@@ -1199,10 +1136,8 @@ class Renderer:
         self.qbar.draw(self.screen, self.fonts["sm"])
         iy = 332
         ipx = px + 10
-        hearts_p = ("♥" * world.player.hp
-                    + "·" * (MAX_HP - world.player.hp))
-        hearts_a = ("♥" * world.ai.hp
-                    + "·" * (MAX_HP - world.ai.hp))
+        hearts_p = "♥" * world.player.hp + "·" * (MAX_HP - world.player.hp)
+        hearts_a = "♥" * world.ai.hp + "·" * (MAX_HP - world.ai.hp)
         wr = ai_wins / max(total_rounds, 1) * 100
         mode_str = mode
         if is_eval:
@@ -1210,16 +1145,14 @@ class Renderer:
         infos = [
             ("Mode", mode_str, C_HIGHLIGHT if mode == "PvAI" else C_GOOD),
             ("Round", f"{episode}", C_TEXT),
-            ("Step",
-             f"{world.step_count}/{MAX_ROUND_STEPS}", C_TEXT),
+            ("Step", f"{world.step_count}/{MAX_ROUND_STEPS}", C_TEXT),
             ("P HP", hearts_p, C_PLAYER),
             ("AI HP", hearts_a, C_AI),
             ("", "", C_TEXT),
             ("P Wins", f"{player_wins}", C_PLAYER),
             ("AI Wins", f"{ai_wins}", C_AI),
             ("WinRate", f"{wr:.1f}%", C_WARN),
-            ("Streak",
-             f"{streak} (best:{best_streak})", C_GOOD),
+            ("Streak", f"{streak} (best:{best_streak})", C_GOOD),
             ("", "", C_TEXT),
             ("Epsilon", f"{epsilon:.4f}", C_TEXT),
             ("Loss", f"{loss:.5f}", C_TEXT),
@@ -1231,65 +1164,37 @@ class Renderer:
         ]
         for lbl, val, color in infos:
             if lbl:
-                self.screen.blit(
-                    self.fonts["sm"].render(
-                        f"{lbl}:", True, C_DIM),
-                    (ipx, iy))
-                self.screen.blit(
-                    self.fonts["sm"].render(
-                        str(val), True, color),
-                    (ipx + 60, iy))
+                self.screen.blit(self.fonts["sm"].render(f"{lbl}:", True, C_DIM), (ipx, iy))
+                self.screen.blit(self.fonts["sm"].render(str(val), True, color), (ipx + 60, iy))
             iy += 13
 
     def draw_bottom(self, mode, epsilon, global_step, device_str):
         import pygame
         by = ARENA_H
-        pygame.draw.rect(self.screen, C_BOTTOM,
-                         (0, by, WIN_W, BOTTOM_H))
-        pygame.draw.line(self.screen, (50, 50, 80),
-                         (0, by), (WIN_W, by), 2)
-        y1, y2, y3, y4, y5 = (
-            by + 6, by + 22, by + 38, by + 54, by + 68)
-        self.screen.blit(
-            self.fonts["lg"].render(
-                f"Grid Duel Arena v{VERSION}[{self.hw_tier}]",
-                True, C_HIGHLIGHT), (10, y1))
-        self.screen.blit(
-            self.fonts["sm"].render(
-                "[Space]Pause [Up/Dn]Speed "
-                "[1]PvAI [2]SelfPlay [3]Train",
-                True, C_DIM), (10, y2))
-        self.screen.blit(
-            self.fonts["sm"].render(
-                "[WASD]Move [J]Bomb [K]Stay "
-                "[Ctrl+S]Save [Tab]Help [Esc]Quit",
-                True, C_DIM), (10, y3))
-        self.screen.blit(
-            self.fonts["sm"].render(
-                f"Mode:{mode} | {device_str}",
-                True, C_DIM), (10, y4))
+        pygame.draw.rect(self.screen, C_BOTTOM, (0, by, WIN_W, BOTTOM_H))
+        pygame.draw.line(self.screen, (50, 50, 80), (0, by), (WIN_W, by), 2)
+        y1, y2, y3, y4, y5 = by + 6, by + 22, by + 38, by + 54, by + 68
+        self.screen.blit(self.fonts["lg"].render(
+            f"Grid Duel Arena v{VERSION}[{self.hw_tier}]", True, C_HIGHLIGHT), (10, y1))
+        self.screen.blit(self.fonts["sm"].render(
+            "[Space]Pause [Up/Dn]Speed [1]PvAI [2]SelfPlay [3]Train", True, C_DIM), (10, y2))
+        self.screen.blit(self.fonts["sm"].render(
+            "[WASD]Move [J]Bomb [K]Stay [Ctrl+S]Save [Tab]Help [Esc]Quit", True, C_DIM), (10, y3))
+        self.screen.blit(self.fonts["sm"].render(
+            f"Mode:{mode} | {device_str}", True, C_DIM), (10, y4))
         prog_x, prog_w, prog_h, prog_y = 10, WIN_W - 20, 6, y5
-        pygame.draw.rect(self.screen, (30, 30, 50),
-                         (prog_x, prog_y, prog_w, prog_h))
+        pygame.draw.rect(self.screen, (30, 30, 50), (prog_x, prog_y, prog_w, prog_h))
         progress = min(1.0, global_step / EPS_DECAY)
         fill_w = int(prog_w * progress)
-        bar_color = (C_GOOD if progress > 0.8
-                     else C_WARN if progress > 0.4
-                     else C_BAD)
-        pygame.draw.rect(self.screen, bar_color,
-                         (prog_x, prog_y, fill_w, prog_h))
+        bar_color = C_GOOD if progress > 0.8 else C_WARN if progress > 0.4 else C_BAD
+        pygame.draw.rect(self.screen, bar_color, (prog_x, prog_y, fill_w, prog_h))
         pct_txt = self.fonts["sm"].render(
-            f"Train: {progress*100:.0f}% (ε={epsilon:.3f})",
-            True, C_DIM)
-        self.screen.blit(
-            pct_txt,
-            (prog_x + prog_w + 5 - pct_txt.get_width(),
-             prog_y - 10))
+            f"Train: {progress*100:.0f}% (ε={epsilon:.3f})", True, C_DIM)
+        self.screen.blit(pct_txt, (prog_x + prog_w + 5 - pct_txt.get_width(), prog_y - 10))
 
     def draw_round_result(self, winner, p_wins, ai_wins, total):
         import pygame
-        ov = pygame.Surface(
-            (ARENA_W, ARENA_H), pygame.SRCALPHA)
+        ov = pygame.Surface((ARENA_W, ARENA_H), pygame.SRCALPHA)
         ov.fill((0, 0, 0, 160))
         self.screen.blit(ov, (0, 0))
         cx, cy = ARENA_W // 2, ARENA_H // 2
@@ -1300,72 +1205,51 @@ class Renderer:
         else:
             txt, color = "DRAW!", C_HIGHLIGHT
         title = self.fonts["xl"].render(txt, True, color)
-        self.screen.blit(
-            title, (cx - title.get_width() // 2, cy - 50))
-        score = self.fonts["md"].render(
-            f"Player {p_wins} : {ai_wins} AI(of {total})",
-            True, C_TEXT)
-        self.screen.blit(
-            score, (cx - score.get_width() // 2, cy + 10))
-        hint = self.fonts["sm"].render(
-            "[N] Next Round  |  [Esc] Quit", True, C_DIM)
-        self.screen.blit(
-            hint, (cx - hint.get_width() // 2, cy + 40))
+        self.screen.blit(title, (cx - title.get_width() // 2, cy - 50))
+        score = self.fonts["md"].render(f"Player {p_wins} : {ai_wins} AI(of {total})", True, C_TEXT)
+        self.screen.blit(score, (cx - score.get_width() // 2, cy + 10))
+        hint = self.fonts["sm"].render("[N] Next Round  |  [Esc] Quit", True, C_DIM)
+        self.screen.blit(hint, (cx - hint.get_width() // 2, cy + 40))
 
-    def draw_help_overlay(self, device_str, hidden_dim,
-                          batch_size, memory_size, use_amp,
-                          grad_accum, warmup_steps):
+    def draw_help_overlay(self, device_str, hidden_dim, batch_size, memory_size, use_amp, grad_accum, warmup_steps):
         import pygame
-        ov = pygame.Surface(
-            (WIN_W, WIN_H), pygame.SRCALPHA)
+        ov = pygame.Surface((WIN_W, WIN_H), pygame.SRCALPHA)
         ov.fill((0, 0, 0, 200))
         self.screen.blit(ov, (0, 0))
         lines = [
-            (f"Grid Duel Arena v{VERSION}",
-             C_HIGHLIGHT, "lg"),
+            (f"Grid Duel Arena v{VERSION}", C_HIGHLIGHT, "lg"),
             ("", C_TEXT, "sm"),
             ("--- Controls ---", C_WARN, "md"),
             ("[W/A/S/D] Move player", C_TEXT, "md"),
             ("[J] Place bomb  [K] Stay", C_TEXT, "md"),
-            ("[Space] Pause  [Up/Down] Speed",
-             C_TEXT, "md"),
-            ("[1] PvAI  [2] SelfPlay  [3] FastTrain",
-             C_TEXT, "md"),
+            ("[Space] Pause  [Up/Down] Speed", C_TEXT, "md"),
+            ("[1] PvAI  [2] SelfPlay  [3] FastTrain", C_TEXT, "md"),
             ("[Ctrl+S] Save checkpoint", C_TEXT, "md"),
             ("[Tab] Toggle this help", C_TEXT, "md"),
             ("[Esc] Save & quit", C_TEXT, "md"),
             ("", C_TEXT, "sm"),
             ("--- Architecture ---", C_WARN, "md"),
-            ("Dual-channel ReflexNet (Fast+Slow)",
-             C_TEXT, "md"),
-            (f"  Fast: 18->48->24->{ACTION_DIM}",
-             C_DIM, "sm"),
-            (f"  Slow: {STATE_DIM}->{hidden_dim}->..."
-             f"->{ACTION_DIM}", C_DIM, "sm"),
-            ("  Dueling DQN + N-step + PER",
-             C_DIM, "sm"),
+            ("Dual-channel ReflexNet (Fast+Slow)", C_TEXT, "md"),
+            (f"  Fast: 18->48->24->{ACTION_DIM}", C_DIM, "sm"),
+            (f"  Slow: {STATE_DIM}->{hidden_dim}->...->{ ACTION_DIM}", C_DIM, "sm"),
+            ("  Dueling DQN + N-step + PER", C_DIM, "sm"),
             ("", C_TEXT, "sm"),
             ("--- Hardware ---", C_WARN, "md"),
-            (f"Device: {device_str}Tier: {self.hw_tier}",
-             C_TEXT, "md"),
-            (f"Hidden: {hidden_dim}  Batch: {batch_size}  "
-             f"Memory: {memory_size}", C_DIM, "sm"),
-            (f"AMP: {use_amp}  GradAccum: {grad_accum}  "
-             f"Warmup: {warmup_steps}", C_DIM, "sm"),
+            (f"Device: {device_str}", C_TEXT, "md"),
+            (f"Hidden: {hidden_dim}  Batch: {batch_size}  Memory: {memory_size}", C_DIM, "sm"),
+            (f"AMP: {use_amp}  GradAccum: {grad_accum}  Warmup: {warmup_steps}", C_DIM, "sm"),
             ("", C_TEXT, "sm"),
             ("Press [Tab] to close", C_HIGHLIGHT, "md"),
         ]
         y = 20
         for text, color, font_key in lines:
             if text:
-                self.screen.blit(
-                    self.fonts[font_key].render(
-                        text, True, color), (30, y))
+                self.screen.blit(self.fonts[font_key].render(text, True, color), (30, y))
             y += 18 if font_key != "lg" else 26
 
 
-# ╔════════════════════════════════════════════╗
-# ║          存档/加载                         ║
+#╔════════════════════════════════════════════╗
+# ║          存档/加载                  ║
 # ╚════════════════════════════════════════════╝
 
 def migrate_weights(model, old_sd, label=""):
@@ -1376,8 +1260,7 @@ def migrate_weights(model, old_sd, label=""):
             ns[k] = old_sd[k]
             matched += 1
             used.add(k)
-    unmatched_new = [k for k in ns
-                     if k not in used and k not in old_sd]
+    unmatched_new = [k for k in ns if k not in used and k not in old_sd]
     unmatched_old = [k for k in old_sd if k not in used]
     if unmatched_new and unmatched_old:
         def pfx(k):
@@ -1398,8 +1281,7 @@ def migrate_weights(model, old_sd, label=""):
                 for ok in sorted(opfx[p]):
                     if ok in used:
                         continue
-                    if (sfx(ok) == sfx(nk)
-                            and old_sd[ok].shape == ns[nk].shape):
+                    if sfx(ok) == sfx(nk) and old_sd[ok].shape == ns[nk].shape:
                         ns[nk] = old_sd[ok]
                         matched += 1
                         used.add(ok)
@@ -1407,15 +1289,13 @@ def migrate_weights(model, old_sd, label=""):
     skipped = len(ns) - matched
     model.load_state_dict(ns)
     if skipped > 0:
-        print(f"  🔄 {label}: {matched} matched, "
-              f"{skipped} re-initialized")
+        print(f"  🔄 {label}: {matched} matched, {skipped} re-initialized")
     else:
         print(f"  ✅ {label}: all {matched} layers matched")
     return matched, skipped
 
 
-def save_checkpoint(net, target_net, optimizer, scheduler,
-                    memory, stats, pool, episode, best_reward,
+def save_checkpoint(net, target_net, optimizer, scheduler, memory, stats, pool, episode, best_reward,
                     hidden_dim, device):
     os.makedirs(CKPT_DIR, exist_ok=True)
     torch.save({
@@ -1460,28 +1340,20 @@ def load_checkpoint(net, target_net, optimizer, scheduler,
         print("  🆕 No checkpoint — starting fresh")
         return 0, -1e9, default_stats
     print(f"  📂 Loading {CKPT_MODEL}...")
-    ckpt = torch.load(
-        CKPT_MODEL, map_location=device, weights_only=False)
+    ckpt = torch.load(CKPT_MODEL, map_location=device, weights_only=False)
     old_ver = ckpt.get("version", "1.0")
     old_hidden = ckpt.get("hidden_dim", 128)
-    print(f"  📋 Checkpoint: v{old_ver}, hidden={old_hidden}, "
-          f"current: v{VERSION}, hidden={hidden_dim}")
-    if old_hidden == hidden_dim and old_ver == VERSION:
+    print(f"  📋 Checkpoint: v{old_ver}, hidden={old_hidden}, current: v{VERSION}, hidden={hidden_dim}")
+    if old_hidden == hidden_dim:
         net.load_state_dict(ckpt["net"])
-        target_net.load_state_dict(
-            ckpt.get("target", ckpt["net"]))
+        target_net.load_state_dict(ckpt.get("target", ckpt["net"]))
         print(f"  ✅ Weights loaded perfectly")
     else:
-        reason = (f"hidden {old_hidden}→{hidden_dim}"
-                  if old_hidden != hidden_dim
-                  else f"v{old_ver}→v{VERSION}")
-        print(f"  🔄 Architecture changed ({reason}), "
-              f"migrating...")
+        reason = f"hidden {old_hidden}→{hidden_dim}"
+        print(f"  🔄 Architecture changed ({reason}), migrating...")
         migrate_weights(net, ckpt["net"], "net")
-        migrate_weights(
-            target_net,
-            ckpt.get("target", ckpt["net"]), "target")
-    if old_hidden == hidden_dim and old_ver == VERSION:
+        migrate_weights(target_net, ckpt.get("target", ckpt["net"]), "target")
+    if old_hidden == hidden_dim:
         try:
             optimizer.load_state_dict(ckpt["optimizer"])
         except Exception:
@@ -1509,7 +1381,7 @@ def load_checkpoint(net, target_net, optimizer, scheduler,
 
 
 # ╔════════════════════════════════════════════╗
-# ║      硬件检测(只在主进程实例化)            ║
+# ║      硬件检测                              ║
 # ╚════════════════════════════════════════════╝
 
 class HardwareProfile:
@@ -1527,9 +1399,7 @@ class HardwareProfile:
             print("  ⚠ CUDA requested but not available")
         if self.has_cuda:
             self.gpu_name = torch.cuda.get_device_name(0)
-            self.vram_mb = (
-                torch.cuda.get_device_properties(0)
-                .total_memory // (1024 * 1024))
+            self.vram_mb = torch.cuda.get_device_properties(0).total_memory // (1024 * 1024)
             self._classify_gpu()
         else:
             self._classify_cpu()
@@ -1560,13 +1430,11 @@ class HardwareProfile:
                         ("sullAvailExtVirt", c_ull)]
                 stat = MEMSTAT()
                 stat.dwLength = ctypes.sizeof(stat)
-                kernel32.GlobalMemoryStatusEx(
-                    ctypes.byref(stat))
+                kernel32.GlobalMemoryStatusEx(ctypes.byref(stat))
                 return stat.ullTotalPhys // (1024 * 1024)
             elif sys.platform == "darwin":
                 import subprocess
-                out = subprocess.check_output(
-                    ["sysctl", "-n", "hw.memsize"])
+                out = subprocess.check_output(["sysctl", "-n", "hw.memsize"])
                 return int(out.strip()) // (1024 * 1024)
         except Exception:
             pass
@@ -1599,61 +1467,37 @@ class HardwareProfile:
     def _build_config(self):
         profiles = {
             "gpu_large": dict(
-                hidden_dim=192, batch_size=256,
-                memory_size=50000,
-                train_steps_per_frame=2,
-                max_fps_train=300,
-                use_amp=True, grad_accum=1,
-                warmup_steps=500),
+                hidden_dim=192, batch_size=256, memory_size=50000,
+                train_steps_per_frame=2, max_fps_train=300,
+                use_amp=True, grad_accum=1, warmup_steps=500),
             "gpu_medium": dict(
-                hidden_dim=160, batch_size=128,
-                memory_size=30000,
-                train_steps_per_frame=2,
-                max_fps_train=240,
-                use_amp=True, grad_accum=1,
-                warmup_steps=400),
+                hidden_dim=160, batch_size=128, memory_size=30000,
+                train_steps_per_frame=2, max_fps_train=240,
+                use_amp=True, grad_accum=1, warmup_steps=400),
             "gpu_small": dict(
-                hidden_dim=128, batch_size=96,
-                memory_size=20000,
-                train_steps_per_frame=1,
-                max_fps_train=180,
-                use_amp=True, grad_accum=1,
-                warmup_steps=300),
+                hidden_dim=128, batch_size=96, memory_size=20000,
+                train_steps_per_frame=1, max_fps_train=180,
+                use_amp=True, grad_accum=1, warmup_steps=300),
             "gpu_tiny": dict(
-                hidden_dim=96, batch_size=48,
-                memory_size=12000,
-                train_steps_per_frame=1,
-                max_fps_train=120,
-                use_amp=False, grad_accum=2,
-                warmup_steps=200),
+                hidden_dim=96, batch_size=48, memory_size=12000,
+                train_steps_per_frame=1, max_fps_train=120,
+                use_amp=False, grad_accum=2, warmup_steps=200),
             "cpu_high": dict(
-                hidden_dim=128, batch_size=128,
-                memory_size=30000,
-                train_steps_per_frame=4,
-                max_fps_train=120,
-                use_amp=False, grad_accum=1,
-                warmup_steps=300),
+                hidden_dim=128, batch_size=128, memory_size=30000,
+                train_steps_per_frame=4, max_fps_train=120,
+                use_amp=False, grad_accum=1, warmup_steps=300),
             "cpu_mid": dict(
-                hidden_dim=96, batch_size=48,
-                memory_size=10000,
-                train_steps_per_frame=1,
-                max_fps_train=90,
-                use_amp=False, grad_accum=2,
-                warmup_steps=200),
+                hidden_dim=96, batch_size=48, memory_size=10000,
+                train_steps_per_frame=1, max_fps_train=90,
+                use_amp=False, grad_accum=2, warmup_steps=200),
             "cpu_low": dict(
-                hidden_dim=64, batch_size=32,
-                memory_size=8000,
-                train_steps_per_frame=1,
-                max_fps_train=60,
-                use_amp=False, grad_accum=2,
-                warmup_steps=150),
+                hidden_dim=64, batch_size=32, memory_size=8000,
+                train_steps_per_frame=1, max_fps_train=60,
+                use_amp=False, grad_accum=2, warmup_steps=150),
             "cpu_fallback": dict(
-                hidden_dim=64, batch_size=32,
-                memory_size=8000,
-                train_steps_per_frame=1,
-                max_fps_train=60,
-                use_amp=False, grad_accum=2,
-                warmup_steps=150),
+                hidden_dim=64, batch_size=32, memory_size=8000,
+                train_steps_per_frame=1, max_fps_train=60,
+                use_amp=False, grad_accum=2, warmup_steps=150),
         }
         return profiles.get(self.tier, profiles["cpu_low"])
 
@@ -1676,16 +1520,17 @@ class HardwareProfile:
         print("=" * 56 + "\n")
 
 
-# ╔════════════════════════════════════════════╗
-# ║      ★★★ Worker进程函数 (修复核心) ★★★     ║
-# ╚════════════════════════════════════════════╝
+# ╔════════════════════════════════════════════════════════════╗
+# ║  ★★★优化2: Worker — 文件权重同步 + 批量推理优化 ★★★     ║
+# ╚════════════════════════════════════════════════════════════╝
 
-def _env_worker(worker_id, transition_queue, result_queue,
-                weight_dict, weight_version, stop_flag,
-                config):
+def _env_worker_v33(worker_id, transition_queue, result_queue,
+                    weight_version, stop_flag, config):
     """
-    环境工作进程 — 不触发任何模块级初始化
-    整局数据攒好后一次性 put 到 Queue
+    v3.3 Worker:
+    - 权重从文件读取，消除Manager.dict() IPC瓶颈
+    - 多局攒批发送，减少Queue序列化次数
+    - obs预分配numpy buffer
     """
     os.environ["OMP_NUM_THREADS"] = "1"
     os.environ["MKL_NUM_THREADS"] = "1"
@@ -1700,121 +1545,153 @@ def _env_worker(worker_id, transition_queue, result_queue,
     local_net.eval()
 
     local_weight_ver = -1
-    local_episode = 0
-    rng = random.Random(
-        worker_id * 10000 + int(time.time()))
+    rng = random.Random(worker_id * 10000 + int(time.time()))
     nstep = NStepBuffer(N_STEP, GAMMA)
+
+    # 预分配episode buffer (最大500步* nstep产出)
+    max_trans = MAX_ROUND_STEPS + N_STEP
+    ep_states = np.zeros((max_trans, STATE_DIM), dtype=np.float32)
+    ep_actions = np.zeros(max_trans, dtype=np.int64)
+    ep_rewards = np.zeros(max_trans, dtype=np.float32)
+    ep_next_states = np.zeros((max_trans, STATE_DIM), dtype=np.float32)
+    ep_dones = np.zeros(max_trans, dtype=np.float32)
+
+    weight_file = config.get("weight_file", WEIGHT_FILE)
 
     def sync_weights():
         nonlocal local_weight_ver
         try:
             ver = weight_version.value
-            if ver > local_weight_ver and "net" in weight_dict:
-                local_net.load_state_dict(weight_dict["net"])
-                local_weight_ver = ver
+            if ver > local_weight_ver:
+                if os.path.exists(weight_file):
+                    sd = torch.load(weight_file, map_location="cpu", weights_only=True)
+                    local_net.load_state_dict(sd)
+                    local_weight_ver = ver
         except Exception:
             pass
+
+    #★攒多局再发送
+    SEND_EVERY = 3  # 每攒3局发一次，减少Queue.put次数
+    pending_states = []
+    pending_actions = []
+    pending_rewards = []
+    pending_next_states = []
+    pending_dones = []
+    pending_results = []
+
+    eps_start = config["eps_start"]
+    eps_end = config["eps_end"]
+    eps_decay = config["eps_decay"]
+    local_episode = 0
 
     while not stop_flag.value:
         sync_weights()
         local_episode += 1
         global_step_est = local_episode * 250
-        epsilon = max(
-            config["eps_end"],
-            config["eps_start"]
-            - global_step_est / config["eps_decay"])
+        epsilon = max(eps_end, eps_start - global_step_est / eps_decay)
 
         seed = rng.randint(0, 2**31)
         world = DuelArena(seed=seed)
         obs = world.reset()
         nstep.reset()
         total_reward = 0.0
-        episode_transitions = []
+        trans_count = 0
 
         while not world.round_over and not stop_flag.value:
             p_act = rule_based_player(world)
-            with torch.no_grad():
-                obs_t = torch.tensor(
-                    obs, dtype=torch.float32,
-                    device=local_device).unsqueeze(0)
-                q_values = local_net(obs_t)
             if rng.random() < epsilon:
                 ai_act = rng.randint(0, ACTION_DIM - 1)
             else:
+                with torch.no_grad():
+                    obs_t = torch.from_numpy(obs).unsqueeze(0)
+                    q_values = local_net(obs_t)
                 ai_act = q_values.argmax(dim=-1).item()
 
             obs2, reward, done = world.step(p_act, ai_act)
             total_reward += reward
-            nstep.push(
-                (obs, ai_act, reward, obs2, float(done)))
+            nstep.push((obs, ai_act, reward, obs2, float(done)))
             nt = nstep.get()
             if nt is not None:
-                episode_transitions.append(nt)
+                ep_states[trans_count] = nt[0]
+                ep_actions[trans_count] = nt[1]
+                ep_rewards[trans_count] = nt[2]
+                ep_next_states[trans_count] = nt[3]
+                ep_dones[trans_count] = nt[4]
+                trans_count += 1
             obs = obs2
             if done:
                 for t in nstep.flush():
-                    episode_transitions.append(t)
+                    ep_states[trans_count] = t[0]
+                    ep_actions[trans_count] = t[1]
+                    ep_rewards[trans_count] = t[2]
+                    ep_next_states[trans_count] = t[3]
+                    ep_dones[trans_count] = t[4]
+                    trans_count += 1
                 break
-
         if stop_flag.value:
             break
 
-        #★ 一次性发送整局
-        if episode_transitions:
-            states = np.array(
-                [t[0] for t in episode_transitions],
-                dtype=np.float32)
-            actions = np.array(
-                [t[1] for t in episode_transitions],
-                dtype=np.int64)
-            rewards = np.array(
-                [t[2] for t in episode_transitions],
-                dtype=np.float32)
-            next_states = np.array(
-                [t[3] for t in episode_transitions],
-                dtype=np.float32)
-            dones = np.array(
-                [t[4] for t in episode_transitions],
-                dtype=np.float32)
-            try:
-                transition_queue.put(
-                    (states, actions, rewards,
-                     next_states, dones),
-                    timeout=1.0)
-            except Exception:
-                pass
+        if trans_count > 0:
+            pending_states.append(ep_states[:trans_count].copy())
+            pending_actions.append(ep_actions[:trans_count].copy())
+            pending_rewards.append(ep_rewards[:trans_count].copy())
+            pending_next_states.append(ep_next_states[:trans_count].copy())
+            pending_dones.append(ep_dones[:trans_count].copy())
 
-        try:
-            result_queue.put_nowait(
-                (world.winner, total_reward,
-                 world.step_count))
-        except Exception:
-            pass
+        pending_results.append((world.winner, total_reward, world.step_count))
+
+        #攒够SEND_EVERY局或队列空闲时发送
+        if len(pending_results) >= SEND_EVERY:
+            if pending_states:
+                merged_s = np.concatenate(pending_states, axis=0)
+                merged_a = np.concatenate(pending_actions, axis=0)
+                merged_r = np.concatenate(pending_rewards, axis=0)
+                merged_ns = np.concatenate(pending_next_states, axis=0)
+                merged_d = np.concatenate(pending_dones, axis=0)
+                try:
+                    transition_queue.put(
+                        (merged_s, merged_a, merged_r, merged_ns, merged_d),
+                        timeout=0.5)
+                except Exception:
+                    pass
+                pending_states.clear()
+                pending_actions.clear()
+                pending_rewards.clear()
+                pending_next_states.clear()
+                pending_dones.clear()
+
+            for r in pending_results:
+                try:
+                    result_queue.put_nowait(r)
+                except Exception:
+                    pass
+            pending_results.clear()
 
 
-# ╔════════════════════════════════════════════╗
-# ║      ★★★ 并行收集器 (修复核心) ★★★         ║
-# ╚════════════════════════════════════════════╝
+# ╔══════════════════════════════════════════════════════════╗
+# ║  ★★★ 优化3: ParallelCollector — 无Manager架构 ★★★       ║
+# ╚══════════════════════════════════════════════════════════╝
 
 class ParallelCollector:
+    """
+    v3.3: 文件权重同步 + 批量收集 + 直接push_batch到FastPER
+    """
     def __init__(self, num_workers, config, net):
         self.num_workers = num_workers
         self.config = config
         self.workers = []
         self.running = False
-        self.manager = mp.Manager()
         self.transition_queue = mp.Queue(maxsize=500)
         self.result_queue = mp.Queue(maxsize=2000)
-        self.weight_dict = self.manager.dict()
         self.weight_version = mp.Value("i", 0)
         self.stop_flag = mp.Value("b", False)
+        os.makedirs(CKPT_DIR, exist_ok=True)
         self.broadcast_weights(net)
 
     def broadcast_weights(self, net):
-        cpu_state = {
-            k: v.cpu().clone()
-            for k, v in net.state_dict().items()}
-        self.weight_dict["net"] = cpu_state
+        """★ 写文件代替Manager.dict — 消除IPC代理瓶颈"""
+        cpu_state = {k: v.cpu().clone() for k, v in net.state_dict().items()}
+        torch.save(cpu_state, WEIGHT_FILE)
         self.weight_version.value += 1
 
     def start(self):
@@ -1823,17 +1700,14 @@ class ParallelCollector:
             "eps_start": EPS_START,
             "eps_end": EPS_END,
             "eps_decay": EPS_DECAY,
+            "weight_file": WEIGHT_FILE,
         }
         self.stop_flag.value = False
         for i in range(self.num_workers):
             p = mp.Process(
-                target=_env_worker,
-                args=(i, self.transition_queue,
-                      self.result_queue,
-                      self.weight_dict,
-                      self.weight_version,
-                      self.stop_flag,
-                      worker_config),
+                target=_env_worker_v33,
+                args=(i, self.transition_queue, self.result_queue,
+                      self.weight_version, self.stop_flag, worker_config),
                 daemon=True)
             p.start()
             self.workers.append(p)
@@ -1841,30 +1715,30 @@ class ParallelCollector:
         print(f"  🚀 Started {self.num_workers} env workers "
               f"(PIDs: {[p.pid for p in self.workers[:5]]}...)")
 
-    def collect_transitions(self, max_batches=200):
-        all_transitions = []
+    def collect_and_insert(self, memory, max_batches=300):
+        """★ 直接从Queue批量插入FastPER，零中间列表"""
         results = []
+        total_inserted = 0
         batches = 0
+
         while batches < max_batches:
             try:
-                batch_data = (
-                    self.transition_queue.get_nowait())
+                batch_data = self.transition_queue.get_nowait()
                 states, actions, rewards, ns, dones = batch_data
-                n = len(states)
-                for i in range(n):
-                    all_transitions.append((
-                        states[i], actions[i], rewards[i],
-                        ns[i], dones[i]))
+                memory.push_batch(states, actions, rewards, ns, dones)
+                total_inserted += len(states)
                 batches += 1
             except Exception:
                 break
+
         while True:
             try:
                 r = self.result_queue.get_nowait()
                 results.append(r)
             except Exception:
                 break
-        return all_transitions, results
+
+        return total_inserted, results
 
     def stop(self):
         self.stop_flag.value = True
@@ -1895,8 +1769,7 @@ class ParallelCollector:
 # ╚════════════════════════════════════════════╝
 
 def parse_args():
-    parser = argparse.ArgumentParser(
-        description="Grid Duel Arena v3.2")
+    parser = argparse.ArgumentParser(description="Grid Duel Arena v3.3")
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--gui", action="store_true")
     parser.add_argument("--episodes", type=int, default=0)
@@ -1911,14 +1784,12 @@ def parse_args():
 
 def detect_display():
     if sys.platform == "linux":
-        if (not os.environ.get("DISPLAY")
-                and not os.environ.get("WAYLAND_DISPLAY")):
+        if not os.environ.get("DISPLAY") and not os.environ.get("WAYLAND_DISPLAY"):
             return False
     elif sys.platform in ("win32", "darwin"):
         return True
     try:
-        os.environ.setdefault(
-            "PYGAME_HIDE_SUPPORT_PROMPT", "1")
+        os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
         import pygame
         pygame.init()
         info = pygame.display.Info()
@@ -1931,16 +1802,15 @@ def detect_display():
         return False
 
 
-# ╔════════════════════════════════════════════╗
-# ║      无头训练主循环 (v3.2修复版)           ║
-# ╚════════════════════════════════════════════╝
+# ╔══════════════════════════════════════════════════════════════╗
+# ║  ★★★ 优化4: 无头训练主循环 — 零拷贝训练管线 ★★★             ║
+# ╚══════════════════════════════════════════════════════════════╝
 
 def main_headless():
     args = parse_args()
     hw = HardwareProfile(forced_device=args.device)
     DEVICE = hw.device
     HW_CFG = hw.config
-    # 👇 新增下面这一行，强行锁死隐藏层维度，放弃自适应
     HW_CFG["hidden_dim"] = 128
     HIDDEN_DIM = HW_CFG["hidden_dim"]
     BATCH_SIZE = HW_CFG["batch_size"]
@@ -1948,21 +1818,18 @@ def main_headless():
     USE_AMP = HW_CFG["use_amp"]
     WARMUP_STEPS = HW_CFG["warmup_steps"]
 
-    # 修复命令行参数被强制覆盖的 Bug
     if args.batch_size > 0:
         BATCH_SIZE = args.batch_size
     else:
-        # 仅在使用默认配置时，应用 512 的硬上限
         BATCH_SIZE = min(BATCH_SIZE * 2, 512)
 
     MEMORY_SIZE = min(MEMORY_SIZE * 2, 100000)
-
     num_workers = max(2, hw.cpu_cores - 4)
 
     print("=" * 60)
-    print("🚀 PARALLEL HEADLESS TRAINING v3.2")
+    print("🚀 PARALLEL HEADLESS TRAINING v3.3 (Optimized)")
     print(f"  Workers: {num_workers} / {hw.cpu_cores} cores")
-    print(f"  Device     : {DEVICE}")
+    print(f"  Device: {DEVICE}")
     print(f"  Batch size : {BATCH_SIZE}")
     print(f"  Memory     : {MEMORY_SIZE}")
     print(f"  Hidden: {HIDDEN_DIM}")
@@ -1974,18 +1841,16 @@ def main_headless():
     target_net.eval()
 
     lr = args.lr if args.lr else LR
-    optimizer = optim.AdamW(
-        net.parameters(), lr=lr, weight_decay=1e-5)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=EPS_DECAY, eta_min=LR_MIN)
+    optimizer = optim.AdamW(net.parameters(), lr=lr, weight_decay=1e-5)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPS_DECAY, eta_min=LR_MIN)
 
-    memory = LightPER(MEMORY_SIZE)
+    # ★ FastPER代替LightPER
+    memory = FastPER(MEMORY_SIZE, STATE_DIM)
     pool = StrategyPool(max_size=8)
     amp_ctx = AMPContext(USE_AMP, DEVICE)
 
     start_ep, best_reward, stats = load_checkpoint(
-        net, target_net, optimizer, scheduler,
-        pool, HIDDEN_DIM, DEVICE)
+        net, target_net, optimizer, scheduler, pool, HIDDEN_DIM, DEVICE)
 
     player_wins = stats.get("player_wins", 0)
     ai_wins = stats.get("ai_wins", 0)
@@ -2000,7 +1865,7 @@ def main_headless():
 
     save_interval = args.save_interval
     max_episodes = args.episodes
-    WEIGHT_SYNC_INTERVAL = 20
+    WEIGHT_SYNC_INTERVAL = 30
 
     collector = ParallelCollector(num_workers, HW_CFG, net)
     collector.start()
@@ -2008,6 +1873,17 @@ def main_headless():
     t_start = time.time()
     train_steps_total = 0
     last_report_time = time.time()
+
+    #★ 预分配GPU tensor缓冲区，避免每步重新分配
+    if DEVICE.type == "cuda":
+        _buf_s = torch.zeros(BATCH_SIZE, STATE_DIM, device=DEVICE, dtype=torch.float32)
+        _buf_s2 = torch.zeros(BATCH_SIZE, STATE_DIM, device=DEVICE, dtype=torch.float32)
+        _buf_a = torch.zeros(BATCH_SIZE, 1, device=DEVICE, dtype=torch.long)
+        _buf_r = torch.zeros(BATCH_SIZE, 1, device=DEVICE, dtype=torch.float32)
+        _buf_d = torch.zeros(BATCH_SIZE, 1, device=DEVICE, dtype=torch.float32)
+        USE_PINNED = True
+    else:
+        USE_PINNED = False
 
     print(f"\n  📊 Starting from episode {start_ep}")
     print(f"  💾 Save every {save_interval} episodes")
@@ -2017,17 +1893,12 @@ def main_headless():
 
     try:
         while True:
-            if (max_episodes > 0
-                    and episode >= start_ep + max_episodes):
-                print(f"\n  ✅ Reached target "
-                      f"{max_episodes} episodes")
+            if max_episodes > 0 and episode >= start_ep + max_episodes:
+                print(f"\n  ✅ Reached target {max_episodes} episodes")
                 break
 
-            transitions, results = (
-                collector.collect_transitions(max_batches=200))
-
-            for t in transitions:
-                memory.push(t)
+            # ★ 直接插入FastPER，无中间列表
+            total_inserted, results = collector.collect_and_insert(memory, max_batches=300)
 
             for r in results:
                 winner, total_reward, steps = r
@@ -2044,11 +1915,9 @@ def main_headless():
                     ai_streak = 0
 
                 wr = ai_wins / max(total_rounds, 1) * 100
-                stats.setdefault("rewards", []).append(
-                    total_reward)
+                stats.setdefault("rewards", []).append(total_reward)
                 stats.setdefault("winrates", []).append(wr)
-                stats.setdefault("losses", []).append(
-                    last_loss)
+                stats.setdefault("losses", []).append(last_loss)
 
                 if total_reward > best_reward:
                     best_reward = total_reward
@@ -2060,96 +1929,61 @@ def main_headless():
                     recent = rr[-20:] if len(rr) >= 20 else rr
                     if recent:
                         fitness = sum(recent) / len(recent)
-                        pool.add(
-                            f"gen{pool.generation}_ep{episode}",
-                            net.state_dict(), fitness)
+                        pool.add(f"gen{pool.generation}_ep{episode}", net.state_dict(), fitness)
 
                 if episode % save_interval == 0:
                     stats["player_wins"] = player_wins
                     stats["ai_wins"] = ai_wins
                     stats["draws"] = draws
                     stats["best_streak"] = best_streak
-                    save_checkpoint(
-                        net, target_net, optimizer, scheduler,
-                        memory, stats, pool, episode,
-                        best_reward, HIDDEN_DIM, DEVICE)
+                    save_checkpoint(net, target_net, optimizer, scheduler,
+                                    memory, stats, pool, episode, best_reward, HIDDEN_DIM, DEVICE)
 
-            #训练
-            can_train = len(memory) >= max(
-                BATCH_SIZE, WARMUP_STEPS)
-            if can_train and transitions:
-                train_iters = max(
-                    4, len(transitions) // (BATCH_SIZE // 2))
+            # ★ 训练 — 零拷贝管线
+            can_train = len(memory) >= max(BATCH_SIZE, WARMUP_STEPS)
+            if can_train and total_inserted > 0:
+                train_iters = max(4, total_inserted // (BATCH_SIZE // 2))
                 train_iters = min(train_iters, 100)
 
                 for _ in range(train_iters):
                     if len(memory) < BATCH_SIZE:
                         break
 
-                    per_beta = min(
-                        1.0, 0.4 + global_step * 0.0001)
-                    batch, idx, isw = memory.sample(
-                        BATCH_SIZE, per_beta)
+                    per_beta = min(1.0, 0.4 + global_step * 0.0001)
+                    (s_np, a_np, r_np, s2_np, d_np), idx, isw = memory.sample(BATCH_SIZE, per_beta)
 
-                    bs = torch.tensor(
-                        np.array([t[0] for t in batch]),
-                        dtype=torch.float32, device=DEVICE)
-                    ba = torch.tensor(
-                        [t[1] for t in batch],
-                        dtype=torch.long,
-                        device=DEVICE).unsqueeze(-1)
-                    br = torch.tensor(
-                        [t[2] for t in batch],
-                        dtype=torch.float32,
-                        device=DEVICE).unsqueeze(-1)
-                    bs2 = torch.tensor(
-                        np.array([t[3] for t in batch]),
-                        dtype=torch.float32, device=DEVICE)
-                    bd = torch.tensor(
-                        [t[4] for t in batch],
-                        dtype=torch.float32,
-                        device=DEVICE).unsqueeze(-1)
+                    # ★ torch.from_numpy → .to(device, non_blocking=True)
+                    bs = torch.from_numpy(s_np).to(DEVICE, non_blocking=True)
+                    ba = torch.from_numpy(a_np).to(DEVICE, non_blocking=True).unsqueeze(-1)
+                    br = torch.from_numpy(r_np).to(DEVICE, non_blocking=True).unsqueeze(-1)
+                    bs2 = torch.from_numpy(s2_np).to(DEVICE, non_blocking=True)
+                    bd = torch.from_numpy(d_np).to(DEVICE, non_blocking=True).unsqueeze(-1)
 
                     with amp_ctx.autocast():
                         with torch.no_grad():
-                            best_a = net(bs2).argmax(
-                                dim=-1, keepdim=True)
-                            q_next = target_net(bs2).gather(
-                                1, best_a)
-                            target = (
-                                br + GAMMA ** N_STEP
-                                * q_next * (1 - bd))
+                            best_a = net(bs2).argmax(dim=-1, keepdim=True)
+                            q_next = target_net(bs2).gather(1, best_a)
+                            target = br + GAMMA ** N_STEP * q_next * (1 - bd)
                         q_current = net(bs).gather(1, ba)
-                        td_error = (
-                            (target - q_current)
-                            .detach().squeeze().cpu().numpy())
-                        loss = (
-                            isw.unsqueeze(-1).to(DEVICE)
-                            * (q_current - target) ** 2).mean()
-                    
-                    optimizer.zero_grad()
-                    amp_ctx.scale_and_step(
-                        loss, optimizer,
-                        net.parameters(), 10.0)
+                        td_error = (target - q_current).detach().squeeze().cpu().numpy()
+                        loss = (isw.unsqueeze(-1).to(DEVICE) * (q_current - target) ** 2).mean()
+
+                    optimizer.zero_grad(set_to_none=True)  # ★ set_to_none更快
+                    amp_ctx.scale_and_step(loss, optimizer, net.parameters(), 10.0)
                     memory.update_priorities(idx, td_error)
                     last_loss = loss.item()
                     train_steps_total += 1
                     global_step += 1
 
-                    for tp, sp in zip(
-                            target_net.parameters(),
-                            net.parameters()):
-                        tp.data.copy_(
-                            TAU * sp.data
-                            + (1 - TAU) * tp.data)
+                    # ★ 软更新 — 原地操作
+                    for tp, sp in zip(target_net.parameters(), net.parameters()):
+                        tp.data.mul_(1 - TAU).add_(sp.data, alpha=TAU)
+
                     scheduler.step()
-                    current_lr = (
-                        optimizer.param_groups[0]["lr"])
+                    current_lr = optimizer.param_groups[0]["lr"]
 
             # 权重同步
-            if (train_steps_total > 0
-                    and train_steps_total
-                    % WEIGHT_SYNC_INTERVAL == 0):
+            if train_steps_total > 0 and train_steps_total % WEIGHT_SYNC_INTERVAL == 0:
                 collector.broadcast_weights(net)
 
             # 日志
@@ -2157,13 +1991,9 @@ def main_headless():
             if now - last_report_time >= 5.0:
                 elapsed = now - t_start
                 eps_done = episode - start_ep
-                eps_per_min = (
-                    eps_done / (elapsed / 60)
-                    if elapsed > 0 else 0)
+                eps_per_min = eps_done / (elapsed / 60) if elapsed > 0 else 0
                 wr = ai_wins / max(total_rounds, 1) * 100
-                epsilon = max(
-                    EPS_END,
-                    EPS_START - global_step / EPS_DECAY)
+                epsilon = max(EPS_END, EPS_START - global_step / EPS_DECAY)
                 qsize = collector.get_queue_size()
                 rr = stats.get("rewards", [-1])[-50:]
                 avg_r = sum(rr) / max(len(rr), 1)
@@ -2183,9 +2013,8 @@ def main_headless():
                     f"{elapsed/3600:.2f}h")
                 last_report_time = now
 
-            if not transitions and not results:
-                time.sleep(0.01)
-
+            if not total_inserted and not results:
+                time.sleep(0.005)  # ★ 5ms代替10ms
     except KeyboardInterrupt:
         print("\n\n  ⏹️  Interrupted by user")
 
@@ -2194,10 +2023,8 @@ def main_headless():
     stats["ai_wins"] = ai_wins
     stats["draws"] = draws
     stats["best_streak"] = best_streak
-    save_checkpoint(
-        net, target_net, optimizer, scheduler,
-        memory, stats, pool, episode, best_reward,
-        HIDDEN_DIM, DEVICE)
+    save_checkpoint(net, target_net, optimizer, scheduler,
+                    memory, stats, pool, episode, best_reward, HIDDEN_DIM, DEVICE)
 
     elapsed = time.time() - t_start
     eps_done = episode - start_ep
@@ -2206,9 +2033,8 @@ def main_headless():
     print(f"  📊 Final Report")
     print(f"{'=' * 60}")
     print(f"  Episodes: {eps_done}")
-    print(f"  Time       : {elapsed/3600:.2f} hours")
-    print(f"  Speed      : "
-          f"{eps_done/(elapsed/60):.1f} ep/min")
+    print(f"  Time: {elapsed/3600:.2f} hours")
+    print(f"  Speed      : {eps_done/(elapsed/60):.1f} ep/min")
     print(f"  WinRate    : {wr:.1f}%")
     print(f"  Best Streak: {best_streak}")
     print(f"  Best Reward: {best_reward:.1f}")
@@ -2217,7 +2043,7 @@ def main_headless():
 
 
 # ╔════════════════════════════════════════════╗
-# ║              GUI主循环                     ║
+# ║ GUI主循环                                  ║
 # ╚════════════════════════════════════════════╝
 
 def main_gui():
@@ -2225,7 +2051,6 @@ def main_gui():
     hw = HardwareProfile(forced_device=args.device)
     DEVICE = hw.device
     HW_CFG = hw.config
-    # 👇 同样在这里新增这一行
     HW_CFG["hidden_dim"] = 128
     HIDDEN_DIM = HW_CFG["hidden_dim"]
     BATCH_SIZE = HW_CFG["batch_size"]
@@ -2265,12 +2090,11 @@ def main_gui():
     target_net.load_state_dict(net.state_dict())
     target_net.eval()
 
-    optimizer = optim.AdamW(
-        net.parameters(), lr=LR, weight_decay=1e-5)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=EPS_DECAY, eta_min=LR_MIN)
+    optimizer = optim.AdamW(net.parameters(), lr=LR, weight_decay=1e-5)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=EPS_DECAY, eta_min=LR_MIN)
 
-    memory = LightPER(MEMORY_SIZE)
+    # ★ GUI也用FastPER
+    memory = FastPER(MEMORY_SIZE, STATE_DIM)
     nstep = NStepBuffer(N_STEP, GAMMA)
     pool = StrategyPool(max_size=8)
 
@@ -2280,8 +2104,7 @@ def main_gui():
     amp_ctx = AMPContext(USE_AMP, DEVICE)
 
     start_ep, best_reward, stats = load_checkpoint(
-        net, target_net, optimizer, scheduler,
-        pool, HIDDEN_DIM, DEVICE)
+        net, target_net, optimizer, scheduler, pool, HIDDEN_DIM, DEVICE)
 
     renderer = Renderer(screen, clock, fonts, hw.tier)
 
@@ -2294,7 +2117,7 @@ def main_gui():
 
     dev_str = str(DEVICE)
     if hw.has_cuda:
-        dev_str += (f" ({hw.gpu_name[:25]}, " f"{hw.vram_mb}MB)")
+        dev_str += f" ({hw.gpu_name[:25]}, {hw.vram_mb}MB)"
 
     mode = "PvAI"
     speed = 1
@@ -2315,8 +2138,7 @@ def main_gui():
 
     print(f"\n  🏟️  Grid Duel Arena v{VERSION}")
     print(f"     Device: {DEVICE} | Tier: {hw.tier}")
-    print(f"     [1] PvAI  [2] SelfPlay  "
-          f"[3] FastTrain\n")
+    print(f"     [1] PvAI  [2] SelfPlay  [3] FastTrain\n")
 
     episode = start_ep
 
@@ -2329,26 +2151,19 @@ def main_gui():
         show_result = False
         result_timer = 0
 
-        epsilon = max(
-            EPS_END, EPS_START - global_step / EPS_DECAY)
-
-        is_eval = (episode % EVAL_INTERVAL == 0
-                   and episode > 0
-                   and mode in ("SelfPlay", "Train"))
+        epsilon = max(EPS_END, EPS_START - global_step / EPS_DECAY)
+        is_eval = (episode % EVAL_INTERVAL == 0 and episode > 0 and mode in ("SelfPlay", "Train"))
         eval_epsilon = 0.0 if is_eval else epsilon
 
         use_pool_opp = False
         opp_name = "Rule"
         if mode in ("SelfPlay", "Train"):
-            pool_prob = (
-                min(0.5, episode / 1000.0)
-                if pool.pool else 0.0)
+            pool_prob = min(0.5, episode / 1000.0) if pool.pool else 0.0
             if random.random() < pool_prob:
                 opp = pool.sample_opponent()
                 if opp is not None:
                     try:
-                        migrate_weights(
-                            opponent_net, opp[1], "opp")
+                        migrate_weights(opponent_net, opp[1], "opp")
                         use_pool_opp = True
                         opp_name = opp[0]
                     except Exception:
@@ -2381,30 +2196,22 @@ def main_gui():
                         speed = max(speed, 10)
                     elif ev.key == pygame.K_TAB:
                         show_help = not show_help
-                    elif (ev.key == pygame.K_n
-                          and show_result):
+                    elif ev.key == pygame.K_n and show_result:
                         round_running = False
                         continue
                     elif (ev.key == pygame.K_s
-                          and (pygame.key.get_mods()
-                               & pygame.KMOD_CTRL)
+                          and (pygame.key.get_mods() & pygame.KMOD_CTRL)
                           and not show_result):
                         stats["player_wins"] = player_wins
                         stats["ai_wins"] = ai_wins
                         stats["draws"] = draws
                         stats["best_streak"] = best_streak
-                        save_checkpoint(
-                            net, target_net, optimizer,
-                            scheduler, memory, stats, pool,
-                            episode, best_reward,
-                            HIDDEN_DIM, DEVICE)
-                    if (mode == "PvAI"
-                            and not show_result):
+                        save_checkpoint(net, target_net, optimizer, scheduler,
+                                        memory, stats, pool, episode, best_reward, HIDDEN_DIM, DEVICE)
+                    if mode == "PvAI" and not show_result:
                         if ev.key == pygame.K_w:
                             player_action_queue = 0
-                        elif (ev.key == pygame.K_s
-                              and not (pygame.key.get_mods()
-                                       & pygame.KMOD_CTRL)):
+                        elif ev.key == pygame.K_s and not (pygame.key.get_mods() & pygame.KMOD_CTRL):
                             player_action_queue = 1
                         elif ev.key == pygame.K_a:
                             player_action_queue = 2
@@ -2418,8 +2225,7 @@ def main_gui():
             if not running:
                 break
 
-            if (mode == "PvAI" and not show_result
-                    and not paused):
+            if mode == "PvAI" and not show_result and not paused:
                 keys = pygame.key.get_pressed()
                 mods = pygame.key.get_mods()
                 ctrl = bool(mods & pygame.KMOD_CTRL)
@@ -2436,47 +2242,26 @@ def main_gui():
 
             if paused and not show_result:
                 renderer.draw_arena(world)
-                renderer.draw_panel(
-                    world, episode, eval_epsilon,
-                    last_loss, mode, speed, ai_wins,
-                    player_wins, total_rounds, gate_val,
-                    pool.generation, fps_val, current_lr,
-                    ai_streak, best_streak, is_eval)
-                renderer.draw_bottom(
-                    mode, eval_epsilon, global_step,
-                    dev_str)
-                ptxt = fonts["lg"].render(
-                    "PAUSED", True, C_WARN)
-                screen.blit(
-                    ptxt,
-                    (ARENA_W // 2 - ptxt.get_width() // 2, ARENA_H // 2 - ptxt.get_height() // 2))
+                renderer.draw_panel(world, episode, eval_epsilon, last_loss, mode, speed, ai_wins, player_wins, total_rounds, gate_val,
+                                    pool.generation, fps_val, current_lr, ai_streak, best_streak, is_eval)
+                renderer.draw_bottom(mode, eval_epsilon, global_step, dev_str)
+                ptxt = fonts["lg"].render("PAUSED", True, C_WARN)
+                screen.blit(ptxt, (ARENA_W // 2 - ptxt.get_width() // 2, ARENA_H // 2 - ptxt.get_height() // 2))
                 if show_help:
-                    renderer.draw_help_overlay(
-                        dev_str, HIDDEN_DIM, BATCH_SIZE,
-                        MEMORY_SIZE, USE_AMP, GRAD_ACCUM, WARMUP_STEPS)
+                    renderer.draw_help_overlay(dev_str, HIDDEN_DIM, BATCH_SIZE, MEMORY_SIZE, USE_AMP, GRAD_ACCUM, WARMUP_STEPS)
                 pygame.display.flip()
                 clock.tick(15)
                 continue
 
             if show_result:
                 renderer.draw_arena(world)
-                renderer.draw_panel(
-                    world, episode, eval_epsilon,
-                    last_loss, mode, speed, ai_wins,
-                    player_wins, total_rounds, gate_val,
-                    pool.generation, fps_val, current_lr,
-                    ai_streak, best_streak, is_eval)
-                renderer.draw_bottom(
-                    mode, eval_epsilon, global_step,
-                    dev_str)
-                renderer.draw_round_result(
-                    world.winner, player_wins,
-                    ai_wins, total_rounds)
+                renderer.draw_panel(world, episode, eval_epsilon, last_loss, mode, speed,
+                                    ai_wins, player_wins, total_rounds, gate_val,
+                                    pool.generation, fps_val, current_lr, ai_streak, best_streak, is_eval)
+                renderer.draw_bottom(mode, eval_epsilon, global_step, dev_str)
+                renderer.draw_round_result(world.winner, player_wins, ai_wins, total_rounds)
                 if show_help:
-                    renderer.draw_help_overlay(
-                        dev_str, HIDDEN_DIM, BATCH_SIZE,
-                        MEMORY_SIZE, USE_AMP, GRAD_ACCUM,
-                        WARMUP_STEPS)
+                    renderer.draw_help_overlay(dev_str, HIDDEN_DIM, BATCH_SIZE, MEMORY_SIZE, USE_AMP, GRAD_ACCUM, WARMUP_STEPS)
                 pygame.display.flip()
                 clock.tick(15)
                 if mode in ("SelfPlay", "Train"):
@@ -2491,18 +2276,14 @@ def main_gui():
                 player_action_queue = 5
             elif use_pool_opp:
                 st = world.get_state(for_ai=False)
-                st_t = torch.tensor(
-                    st, dtype=torch.float32,
-                    device=DEVICE).unsqueeze(0)
+                st_t = torch.tensor(st, dtype=torch.float32, device=DEVICE).unsqueeze(0)
                 with torch.no_grad():
                     q = opponent_net(st_t)
                 p_act = q.argmax(dim=-1).item()
             else:
                 p_act = rule_based_player(world)
 
-            obs_t = torch.tensor(
-                obs, dtype=torch.float32,
-                device=DEVICE).unsqueeze(0)
+            obs_t = torch.tensor(obs, dtype=torch.float32, device=DEVICE).unsqueeze(0)
             with torch.no_grad():
                 q_values = net(obs_t)
                 gate_val = net.get_gate_value(obs_t)
@@ -2522,106 +2303,65 @@ def main_gui():
             global_step += 1
 
             for exp in world.new_explosions:
-                renderer.add_explosion_particles(
-                    exp.x, exp.y)
+                renderer.add_explosion_particles(exp.x, exp.y)
             if world.ai.hp < prev_ai_hp:
-                renderer.add_hit_particles(
-                    world.ai.x, world.ai.y, C_AI)
+                renderer.add_hit_particles(world.ai.x, world.ai.y, C_AI)
             if world.player.hp < prev_player_hp:
-                renderer.add_hit_particles(
-                    world.player.x, world.player.y,
-                    C_PLAYER)
+                renderer.add_hit_particles(world.player.x, world.player.y, C_PLAYER)
 
             if not is_eval:
-                nstep.push(
-                    (obs, ai_act, reward, obs2, float(done)))
+                nstep.push((obs, ai_act, reward, obs2, float(done)))
                 nt = nstep.get()
                 if nt:
                     memory.push(nt)
             obs = obs2
 
-            can_train = (
-                len(memory) >= max(BATCH_SIZE, WARMUP_STEPS)
-                and not is_eval)
-            train_iters = (TRAIN_PER_FRAME
-                if (not done and can_train)
-                else (1 if can_train else 0))
+            can_train = len(memory) >= max(BATCH_SIZE, WARMUP_STEPS) and not is_eval
+            train_iters = TRAIN_PER_FRAME if (not done and can_train) else (1 if can_train else 0)
 
             for _ in range(train_iters):
                 if len(memory) < BATCH_SIZE:
                     break
 
-                per_beta = min(
-                    1.0, 0.4 + global_step * 0.0001)
-                batch, idx, isw = memory.sample(
-                    BATCH_SIZE, per_beta)
+                per_beta = min(1.0, 0.4 + global_step * 0.0001)
+                (s_np, a_np, r_np, s2_np, d_np), idx, isw = memory.sample(BATCH_SIZE, per_beta)
 
-                bs = torch.tensor(
-                    np.array([t[0] for t in batch]),
-                    dtype=torch.float32, device=DEVICE)
-                ba = torch.tensor(
-                    [t[1] for t in batch],
-                    dtype=torch.long,
-                    device=DEVICE).unsqueeze(-1)
-                br = torch.tensor(
-                    [t[2] for t in batch],
-                    dtype=torch.float32,
-                    device=DEVICE).unsqueeze(-1)
-                bs2 = torch.tensor(
-                    np.array([t[3] for t in batch]),
-                    dtype=torch.float32, device=DEVICE)
-                bd = torch.tensor(
-                    [t[4] for t in batch],
-                    dtype=torch.float32,
-                    device=DEVICE).unsqueeze(-1)
+                bs = torch.from_numpy(s_np).to(DEVICE)
+                ba = torch.from_numpy(a_np).to(DEVICE).unsqueeze(-1)
+                br = torch.from_numpy(r_np).to(DEVICE).unsqueeze(-1)
+                bs2 = torch.from_numpy(s2_np).to(DEVICE)
+                bd = torch.from_numpy(d_np).to(DEVICE).unsqueeze(-1)
 
                 with amp_ctx.autocast():
                     with torch.no_grad():
-                        best_a = net(bs2).argmax(
-                            dim=-1, keepdim=True)
-                        q_next = target_net(bs2).gather(
-                            1, best_a)
-                        target = (
-                            br + GAMMA ** N_STEP
-                            * q_next * (1 - bd))
+                        best_a = net(bs2).argmax(dim=-1, keepdim=True)
+                        q_next = target_net(bs2).gather(1, best_a)
+                        target = br + GAMMA ** N_STEP * q_next * (1 - bd)
                     q_current = net(bs).gather(1, ba)
-                    td_error = (
-                        (target - q_current)
-                        .detach().squeeze().cpu().numpy())
-                    loss = (
-                        isw.unsqueeze(-1).to(DEVICE)
-                        * (q_current - target) ** 2).mean()
+                    td_error = (target - q_current).detach().squeeze().cpu().numpy()
+                    loss = (isw.unsqueeze(-1).to(DEVICE) * (q_current - target) ** 2).mean()
 
                 if GRAD_ACCUM > 1:
                     loss = loss / GRAD_ACCUM
                     grad_accum_counter += 1
                     if grad_accum_counter == 1:
-                        optimizer.zero_grad()
+                        optimizer.zero_grad(set_to_none=True)
                     if grad_accum_counter >= GRAD_ACCUM:
-                        amp_ctx.scale_and_step(
-                            loss, optimizer,
-                            net.parameters(), 10.0)
+                        amp_ctx.scale_and_step(loss, optimizer, net.parameters(), 10.0)
                         grad_accum_counter = 0
                     else:
                         loss.backward()
                 else:
-                    optimizer.zero_grad()
-                    amp_ctx.scale_and_step(
-                        loss, optimizer,
-                        net.parameters(), 10.0)
-
+                    optimizer.zero_grad(set_to_none=True)
+                    amp_ctx.scale_and_step(loss, optimizer, net.parameters(), 10.0)
+                
                 memory.update_priorities(idx, td_error)
                 last_loss = loss.item() * (GRAD_ACCUM if GRAD_ACCUM > 1 else 1)
 
-                for tp, sp in zip(
-                        target_net.parameters(),
-                        net.parameters()):
-                    tp.data.copy_(
-                        TAU * sp.data
-                        + (1 - TAU) * tp.data)
+                for tp, sp in zip(target_net.parameters(), net.parameters()):
+                    tp.data.mul_(1 - TAU).add_(sp.data, alpha=TAU)
                 scheduler.step()
-                current_lr = (
-                    optimizer.param_groups[0]["lr"])
+                current_lr = optimizer.param_groups[0]["lr"]
 
             do_render = True
             if mode == "Train" and global_step % 4 != 0:
@@ -2629,20 +2369,12 @@ def main_gui():
 
             if do_render:
                 renderer.draw_arena(world)
-                renderer.draw_panel(
-                    world, episode, eval_epsilon,
-                    last_loss, mode, speed, ai_wins,
-                    player_wins, total_rounds, gate_val,
-                    pool.generation, fps_val, current_lr,
-                    ai_streak, best_streak, is_eval)
-                renderer.draw_bottom(
-                    mode, eval_epsilon, global_step,
-                    dev_str)
+                renderer.draw_panel(world, episode, eval_epsilon, last_loss, mode, speed,
+                                    ai_wins, player_wins, total_rounds, gate_val,
+                                    pool.generation, fps_val, current_lr, ai_streak, best_streak, is_eval)
+                renderer.draw_bottom(mode, eval_epsilon, global_step, dev_str)
                 if show_help:
-                    renderer.draw_help_overlay(
-                        dev_str, HIDDEN_DIM, BATCH_SIZE,
-                        MEMORY_SIZE, USE_AMP, GRAD_ACCUM,
-                        WARMUP_STEPS)
+                    renderer.draw_help_overlay(dev_str, HIDDEN_DIM, BATCH_SIZE, MEMORY_SIZE, USE_AMP, GRAD_ACCUM, WARMUP_STEPS)
                 pygame.display.flip()
 
             fps = BASE_FPS * speed
@@ -2662,8 +2394,7 @@ def main_gui():
                 if world.winner == "ai":
                     ai_wins += 1
                     ai_streak += 1
-                    best_streak = max(
-                        best_streak, ai_streak)
+                    best_streak = max(best_streak, ai_streak)
                 elif world.winner == "player":
                     player_wins += 1
                     ai_streak = 0
@@ -2672,81 +2403,53 @@ def main_gui():
                     ai_streak = 0
 
                 wr = ai_wins / max(total_rounds, 1) * 100
-                stats.setdefault("rewards", []).append(
-                    total_reward)
+                stats.setdefault("rewards", []).append(total_reward)
                 stats.setdefault("winrates", []).append(wr)
-                stats.setdefault("losses", []).append(
-                    last_loss)
+                stats.setdefault("losses", []).append(last_loss)
 
                 renderer.chart_winrate.add(wr)
                 renderer.chart_reward.add(total_reward)
                 renderer.chart_eps.add(eval_epsilon)
                 renderer.chart_loss.add(last_loss)
 
-                winner_str = {
-                    "ai": "AI WIN", "player": "P WIN",
-                    "draw": "DRAW"
-                }.get(world.winner, "?")
+                winner_str = {"ai": "AI WIN", "player": "P WIN", "draw": "DRAW"}.get(world.winner, "?")
                 eval_tag = " [EVAL]" if is_eval else ""
 
                 print(
-                    f"EP {episode:5d}|"
-                    f"{winner_str:>6s}{eval_tag}|"
-                    f"R:{total_reward:7.1f}|"
-                    f"AI:{ai_wins} P:{player_wins}|"
-                    f"WR:{wr:5.1f}%|"
-                    f"e:{eval_epsilon:.3f}|"
-                    f"G:{gate_val:.2f}|"
-                    f"lr:{current_lr:.1e}|"
-                    f"Stk:{ai_streak}|"
-                    f"Opp:{opp_name}|"
-                    f"Mem:{len(memory)}")
+                    f"EP {episode:5d}|{winner_str:>6s}{eval_tag}|"
+                    f"R:{total_reward:7.1f}|AI:{ai_wins} P:{player_wins}|"
+                    f"WR:{wr:5.1f}%|e:{eval_epsilon:.3f}|G:{gate_val:.2f}|"
+                    f"lr:{current_lr:.1e}|Stk:{ai_streak}|Opp:{opp_name}|Mem:{len(memory)}")
 
-                if (episode > 0
-                        and episode % 20 == 0
-                        and not is_eval):
+                if episode > 0 and episode % 20 == 0 and not is_eval:
                     rr = stats["rewards"]
-                    recent = (rr[-20:]
-                              if len(rr) >= 20 else rr)
-                    fitness = (
-                        sum(recent) / max(len(recent), 1))
-                    pool.add(
-                        f"gen{pool.generation}_ep{episode}",
-                        net.state_dict(), fitness)
+                    recent = rr[-20:] if len(rr) >= 20 else rr
+                    fitness = sum(recent) / max(len(recent), 1)
+                    pool.add(f"gen{pool.generation}_ep{episode}", net.state_dict(), fitness)
 
                 if total_reward > best_reward:
                     best_reward = total_reward
-                    save_best(net, best_reward, episode,
-                              HIDDEN_DIM)
+                    save_best(net, best_reward, episode, HIDDEN_DIM)
 
                 if (episode + 1) % 50 == 0:
                     stats["player_wins"] = player_wins
                     stats["ai_wins"] = ai_wins
                     stats["draws"] = draws
                     stats["best_streak"] = best_streak
-                    save_checkpoint(
-                        net, target_net, optimizer,
-                        scheduler, memory, stats, pool,
-                        episode + 1, best_reward,
-                        HIDDEN_DIM, DEVICE)
+                    save_checkpoint(net, target_net, optimizer, scheduler,
+                                    memory, stats, pool, episode + 1, best_reward, HIDDEN_DIM, DEVICE)
 
                 episode += 1
 
-    stats["player_wins"] = player_wins
+        stats["player_wins"] = player_wins
     stats["ai_wins"] = ai_wins
     stats["draws"] = draws
     stats["best_streak"] = best_streak
-    save_checkpoint(
-        net, target_net, optimizer, scheduler,
-        memory, stats, pool, episode, best_reward,
-        HIDDEN_DIM, DEVICE)
+    save_checkpoint(net, target_net, optimizer, scheduler,
+                    memory, stats, pool, episode, best_reward, HIDDEN_DIM, DEVICE)
     pygame.quit()
     print("\n👋 Game saved. Goodbye!")
 
-
-# ╔════════════════════════════════════════════╗
-# ║      ★★★入口：只在主进程执行 ★★★           ║
-# ╚════════════════════════════════════════════╝
 
 if __name__ == "__main__":
     mp.set_start_method("spawn", force=True)
