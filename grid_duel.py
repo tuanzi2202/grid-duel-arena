@@ -1457,8 +1457,9 @@ class HardwareProfile:
 
     def _build_config(self):
         profiles = {
-            "gpu_xl": dict(hidden_dim=512, batch_size=512, memory_size=200000,
-                           train_iters=16, use_amp=True, warmup=1000, envs_per_worker=16, wfrac=0.6),
+            # 请定位到 _build_config 方法，更新 gpu_xl 的配置字典
+            "gpu_xl": dict(hidden_dim=512, batch_size=2048, memory_size=500000,
+                           train_iters=48, use_amp=True, warmup=2000, envs_per_worker=16, wfrac=0.6),
             "gpu_large": dict(hidden_dim=512, batch_size=384, memory_size=150000,
                               train_iters=12, use_amp=True, warmup=800, envs_per_worker=12, wfrac=0.6),
             "gpu_medium": dict(hidden_dim=384, batch_size=256, memory_size=100000,
@@ -1510,6 +1511,11 @@ def migrate_weights_v4(model, old_sd, label=""):
 def save_checkpoint(net, target_net, optimizer, scheduler, memory,
                     stats, pool, episode, best_reward, hidden_dim, device):
     os.makedirs(CKPT_DIR, exist_ok=True)
+    
+    # 1. 定义临时文件名
+    tmp_model_path = CKPT_MODEL + ".tmp"
+    
+    # 2. 先将数据安全地写入临时文件
     torch.save({
         "version": VERSION, "episode": episode,
         "best_reward": best_reward, "hidden_dim": hidden_dim,
@@ -1518,7 +1524,11 @@ def save_checkpoint(net, target_net, optimizer, scheduler, memory,
         "target": target_net.state_dict(),
         "optimizer": optimizer.state_dict(),
         "scheduler": scheduler.state_dict(),
-    }, CKPT_MODEL)
+    }, tmp_model_path)
+    
+    # 3. 写入完成后，原子化替换原文件（极快，且不会因意外中断导致原文件损坏）
+    os.replace(tmp_model_path, CKPT_MODEL)
+
     ss = {k: (v[-5000:] if isinstance(v, list) else v) for k, v in stats.items()}
     with open(CKPT_STATS, "w") as f:
         json.dump(ss, f, indent=2)
