@@ -409,18 +409,19 @@ class DuelArena:
             reward -= 0.02
         elif dist >= 9:
             reward -= 0.03
+            
         for exp in self.explosions:
             if self.ai.x == exp.x and self.ai.y == exp.y:
                 reward -= 0.5
+                
         for b in self.bombs:
             in_line = ((b.x == self.ai.x and abs(b.y - self.ai.y) <= b.power)
                        or (b.y == self.ai.y and abs(b.x - self.ai.x) <= b.power))
             if in_line:
+                # 修复1：无论定时器剩多少，只要在十字线上就立刻持续扣大分，逼迫它第一时间走位
                 urgency = 1.0 - b.timer / BOMB_TIMER
-                if b.timer <= 2:
-                    reward -= 0.4 * urgency
-                elif b.timer <= 4:
-                    reward -= 0.15 * urgency
+                reward -= (0.6 * urgency + 0.15)
+                
         hp_diff = self.ai.hp - self.player.hp
         reward += hp_diff * 0.04
         if self.player.hp < self.player.prev_hp:
@@ -429,21 +430,27 @@ class DuelArena:
             reward -= 1.0
         if not self.last_ai_move_valid:
             reward -= 0.08
+            
+        # 修复2：取消无脑放炸弹的白嫖奖励。近身放奖励，空旷处乱放直接扣分！
         if self.ai.last_action == 4 and self.last_ai_move_valid:
-            reward += 0.3 if dist <= 4 else 0.05
+            reward += 0.4 if dist <= 3 else -0.2
+            
         cx = abs(self.ai.x - ARENA_COLS // 2)
         cy = abs(self.ai.y - ARENA_ROWS // 2)
         if cx + cy <= 3:
             reward += 0.02
+            
         escape_routes = 0
         for dx, dy in [(0, -1), (0, 1), (-1, 0), (1, 0)]:
             if self._can_move(self.ai.x + dx, self.ai.y + dy):
                 escape_routes += 1
         if escape_routes == 0:
             reward -= 0.15
+            
         if self.bricks_broken_by_ai > 0:
             reward += 0.1 * self.bricks_broken_by_ai
             self.bricks_broken_by_ai = 0
+            
         return np.clip(reward, -3.0, 3.0)
 
     def _spawn_random_powerup(self):
